@@ -83,17 +83,17 @@
  * from that flat file -- robust and format-agnostic (no re-parsing of Intel HEX
  * on a miss). */
 #define FLASH_PAGE_SIZE 0x1000u /* 4 KB cache granularity (matches FlipperGB) */
-/* Heap kept free for the GUI direct-draw takeover + input + system services
- * while the emulator runs (rx_queue ~4KB, CC1101, canvas, etc.). Mirrors
- * FlipperGB's HEAP_RESERVE, with the same degrade ladder if slots are scarce. */
-#define FLASH_HEAP_RESERVE (10u * 1024u)
-/* Minimum 4KB slots to accept. Post-boot the firmware runs from RAM and reads
- * only ~11 distinct code pages, rarely (cold path): a small LRU cache is fully
- * correct, only the SD miss rate changes. 4 is a safe floor (matches
- * FlipperGB). */
-#define FLASH_MIN_SLOTS 4u
+/* Heap kept free for the GUI direct-draw takeover, RX queue, and system services
+ * while the emulator runs. */
+#define FLASH_HEAP_RESERVE (14u * 1024u)
+/* One cache page is sufficient for correctness: post-boot the firmware runs
+ * from RAM, and fewer slots only increase cold-path SD reads. Keep loading
+ * possible on fragmented/low-memory devices instead of rejecting below 4 slots. */
+#define FLASH_MIN_SLOTS 1u
 
 #define FRAME_US 30000u /* ~33 Hz UI refresh */
+#define SCREEN_REFRESH_FALLBACK_MS 100u /* repaint static firmware screens too */
+#define EMU_INSN_PER_RX_FRAME 3000u /* prioritize receiver injection while in RX */
 /* Firmware instructions executed per UI frame. Caps the emulation rate so the
  * firmware's inactivity timeout (~280k insn) fires at a human scale (sub-mode
  * stays ~a couple seconds before auto-returning), like the real keyfob. On the
@@ -104,14 +104,11 @@
  * "rate=70 k-insn/s" -- the interpreter is ~33x slower than a PC's 2.3 M-insn/s):
  *   - old 40000 -> 40000/70000 = ~570ms of CPU per main-loop iteration. Input is
  *     only re-polled once per iteration, so buttons were polled ~1.75x/s -> laggy.
- *   - new 10000 -> 10000/70000 = ~143ms per iteration -> input polled ~7x/s.
- * This does NOT reduce total insn/s: the loop runs back-to-back, it just hands
- * control back to the input poll more often. Render cost per iteration
- * (render_oled ~5888 simple bit-twiddle ops + canvas_commit) stays constant, so
- * at burst=10000 the interpreted work (10000 insn, each decoding to many ops)
- * still dominates (~>90%); render overhead is <10%. Do NOT go below ~6000 or the
- * per-frame render starts to dominate and useful insn/s drops. */
-#define EMU_INSN_PER_FRAME 10000u
+ *   - 6000 -> 6000/70000 = ~86ms per loop -> input is polled about 12x/s.
+ * OLED conversion and canvas commits happen immediately when firmware commits a
+ * new frame, with a slower fallback repaint for static screens and direct-draw
+ * surfaces that need periodic refresh. */
+#define EMU_INSN_PER_FRAME 6000u
 
 /* Window (in instructions) where the knock scanner is active after boot.
  * The keyfob enters low power afterwards; that is why the unlock is done at
@@ -127,10 +124,8 @@
 #define KNOCK_STEP_BUDGET 1500000ull
 #define KNOCK_RELEASE_AFTER 4
 
-/* --- POST-unlock navigation (nav_button) tuning. Mirrors pandora_tui.py:
- *   hold_reads=40 (short click), long_reads=120 (long press), budget 4M insn,
- *   adaptive settle up to 500k insn that stops as soon as the framebuffer
- *   changes (UI redrew) -> ~0.2s response instead of ~1s. */
+/* POST-unlock navigation mirrors pandora_tui.py's read-counted short/long
+ * presses. Small interpreter slices bound the time between dispatch and redraw. */
 #define NAV_HOLD_READS 40u
 #define NAV_LONG_READS 120u
 /* --- Recalibrated @ ~70 k-insn/s (times below assume the worst case of the cap
@@ -139,26 +134,21 @@
  * NAV_BUDGET_INSN: SAFETY CAP for press+hold+release. The loop exits as soon as
  * nav_phase==2 (release dispatched), which normally happens after the firmware
  * has re-read our pin NAV_HOLD_READS(40)/NAV_LONG_READS(120) times. The press
- * loop advances in 50000-insn bursts, so a long press needs on the order of a
- * few hundred k insn to register. @ 70 k-insn/s: old 4M = ~57s cap; new 1.0M =
+ * loop advances in short instruction bursts, so a long press needs on the order
+ * of a few hundred k insn to register. @ 70 k-insn/s: old 4M = ~57s cap; new 1.0M =
  * ~14s cap. 1.0M still leaves a generous ~20x margin over the insn a long press
  * actually needs to register, so the press is never clipped -- it only trims the
  * "firmware never released" pathological timeout. */
 #define NAV_BUDGET_INSN 1000000ull
-/* NAV_SETTLE_INSN: adaptive post-dispatch settle CAP (only reached if the UI
- * never redraws). @ 70 k-insn/s: old 500k = ~7.1s; new 180k = ~2.6s. */
-#define NAV_SETTLE_INSN 180000ull
-/* NAV_SETTLE_MIN_INSN: floor before an fb change is allowed to cut the settle,
- * to avoid cutting on a mid-redraw transient. The settle advances in 60000-insn
- * bursts, so one burst already clears this floor -> we can cut after the FIRST
- * burst (~0.4s @ 70 k-insn/s) once the UI redraws. @ 70 k-insn/s: old 120k =
- * ~1.7s; new 30k = ~0.43s. */
-#define NAV_SETTLE_MIN_INSN 30000ull /* don't cut before this even on fb change */
-/* NAV_SETTLE_BURST: granularity of the adaptive settle loop. Smaller = the
- * fb-change check runs more often -> the settle cuts sooner once the UI redraws.
- * Matched to NAV_SETTLE_MIN_INSN so ONE burst reaches the floor and a redraw can
- * be cut at the earliest allowed point (~0.43s @ 70 k-insn/s). */
-#define NAV_SETTLE_BURST 60000u
+/* Briefly advance after release; the main loop continues the redraw afterward,
+ * so a slow screen update must not keep input blocked. */
+#define NAV_SETTLE_INSN 30000ull
+/* Require two short settle slices before accepting a framebuffer change. */
+#define NAV_SETTLE_MIN_INSN 10000ull
+/* Small navigation slices keep the synchronous press/settle path from running
+ * hundreds of milliseconds past the firmware's actual button dispatch. */
+#define NAV_PRESS_BURST 5000u
+#define NAV_SETTLE_BURST 5000u
 
 /* Physical hold detection (Flipper keys). Hold > ~500ms = long press of the
  * corresponding keyfob button. Flipper UP held > 1s = EXIT the app (Button 1
@@ -450,15 +440,24 @@ static const uint8_t FK_TO_KBIT[FK_COUNT] = {
  * (measured by ninsn between toggles) in a LevelDuration ring and replay it
  * through furi_hal_subghz_start_async_tx.
  *
- * MEMORY: the ring lives inside AppState (one block). 512 edges (=4KB at 8B/edge)
- * is ample for a keyfob frame (the drain fires every >=16 pending edges, many
- * times per frame) and keeps AppState small so the paged flash cache gets more
- * 4KB slots. The old 2048 (16KB) dominated AppState and starved the cache. */
+ * MEMORY: 512 edges (about 4KB) are reserved for a captured frame while keeping
+ * the flash cache from losing several pages to an oversized TX buffer. */
 #define TX_RING_LEN 512u
-/* RX: furi_hal_subghz_start_async_rx delivers (level,duration_us) per edge
- * from IRQ. It is queued thread-safe; in the main loop it is injected into the
- * firmware demodulator (ISR 0x09554) replicating feed_sub from arm_pandora.py. */
-#define RX_QUEUE_LEN 512u
+/* RX: the CC1101 capture ISR writes edges to a single-producer/single-consumer
+ * ring; the emulator thread feeds them to the firmware demodulator. */
+#define RX_RING_LEN 2048u
+#define RX_PUMP_MAX_EDGES 512u
+#define RX_PREROLL_LEN 256u /* retain roughly 60-120 ms before RSSI trigger */
+#define RX_SPOOL_SLOTS 2u
+#define RX_SPOOL_BATCH 256u
+#define RX_SPOOL_MAX_BYTES (256u * 1024u)
+#define RX_POSTROLL_MS 100u
+#define RX_RSSI_POLL_MS 20u
+#define RX_RSSI_MIN_OPEN_DBM (-95.0f)
+#define RX_RSSI_NOISE_MARGIN_DB 6.0f
+#define RX_RSSI_HYSTERESIS_DB 3.0f
+#define RX_RSSI_HANG_MS 100u
+#define RX_HEARTBEAT_MS 5000u
 
 /* ninsn->us conversion for the bit-bang TX. The keyfob is not real-time under
  * the interpreter; the scale is approximate and only affects the replayed
@@ -516,6 +515,32 @@ typedef struct {
     bool level;
     uint32_t duration; /* us */
 } RfEdge;
+
+/* RX durations are ultimately loaded into a 16-bit timer (duration * 6).
+ * Keeping the low 16 bits is exact for that peripheral and halves ring memory. */
+typedef struct {
+    uint16_t duration;
+    uint8_t level;
+    uint8_t gate_open; /* snapshot at capture time; padding-free on 32-bit ABI */
+} RxEdge;
+
+typedef enum {
+    RxSpoolFree = 0,
+    RxSpoolWriting,
+    RxSpoolReady,
+    RxSpoolPlaying,
+    RxSpoolFailed,
+} RxSpoolState;
+
+typedef struct {
+    File* file;
+    RxSpoolState state;
+    uint32_t bytes;
+    uint32_t play_pos;
+    uint32_t order;
+    uint32_t write_errors;
+    char path[48];
+} RxSpool;
 
 /* ---------------------------------------------------------------- FlashCache
  * Paged LRU cache of the emulated firmware flash. Each slot is an independent
@@ -689,16 +714,55 @@ typedef struct {
     bool tx_active; /* async_tx in progress */
     uint32_t tx_frames; /* counter of logged TX frames */
     uint32_t tx_edges_frame; /* accumulated edges of the current frame */
+    uint32_t tx_edges_dropped; /* waveform intervals lost to a full ring */
 
-    /* RX bridge: thread-safe queue fed from the CC1101 IRQ */
-    FuriMessageQueue* rx_queue;
+    /* RX bridge: single-producer (CC1101 capture ISR), single-consumer ring. */
+    RxEdge* rx_ring;
+    volatile uint32_t rx_head; /* ISR producer sequence */
+    volatile uint32_t rx_tail; /* emulator consumer sequence */
     bool rx_running; /* async_rx active */
     bool rx_primed; /* receiver RAM state prepared (prime_rx) */
     bool rx_prev_level; /* previous level for the transition feed */
     bool rx_feeding; /* 1 while the demod ISR runs (TIMER1=pulse_ticks) */
     uint32_t rx_pulse_ticks; /* TIMER1_CNT to present during the feed (dur*6) */
-    uint32_t rx_events; /* counter of injected RX edges */
+    uint32_t rx_events; /* raw edges delivered by the CC1101 callback */
+    uint32_t rx_injected; /* edges actually delivered to the emulated demod ISR */
+    uint32_t rx_dropped; /* edges rejected because the RX queue was full */
     uint32_t rx_frames; /* frames decoded by the firmware */
+    RxEdge rx_preroll[RX_PREROLL_LEN]; /* recent raw edges before RSSI gate opens */
+    volatile uint16_t rx_preroll_head;
+    volatile uint16_t rx_preroll_count;
+    volatile uint8_t rx_preroll_frozen;
+    volatile uint32_t rx_postroll_isr_us;
+    uint32_t rx_preroll_overwritten;
+    uint32_t rx_idle_edges;
+    uint32_t rx_gate_open_count;
+    uint32_t rx_gate_close_count;
+    RxSpool rx_spool[RX_SPOOL_SLOTS];
+    RxEdge rx_spool_batch[RX_SPOOL_BATCH];
+    RxEdge rx_spool_play_batch[RX_SPOOL_BATCH];
+    uint16_t rx_spool_batch_count;
+    uint16_t rx_spool_play_count;
+    uint16_t rx_spool_play_index;
+    int8_t rx_spool_writer;
+    int8_t rx_spool_player;
+    uint32_t rx_spool_order;
+    uint32_t rx_spool_bursts;
+    uint32_t rx_spool_replayed;
+    uint32_t rx_spool_lost;
+    uint16_t rx_gate_sample_duration[8];
+    uint8_t rx_gate_sample_level[8];
+    uint8_t rx_gate_sample_count;
+    uint32_t rx_capture_post_remaining_us;
+    bool rx_capture_active;
+    bool rx_capture_blocked;
+    volatile uint8_t rx_gate_open_isr; /* sampled by capture IRQ */
+    float rx_rssi_dbm;
+    float rx_noise_floor_dbm;
+    float rx_gate_open_dbm;
+    bool rx_rssi_initialized;
+    uint32_t rx_rssi_sample_tick;
+    uint32_t rx_gate_below_tick;
 
     /* --- RF "follow firmware" bridge (Si4432 -> CC1101 auto mapping) ---
      * When rf_follow is true (the default), the CC1101 mode/frequency track what
@@ -707,11 +771,15 @@ typedef struct {
      * still works as a diagnostic override (it flips rf_follow off). */
     bool rf_follow; /* true: CC1101 mode/freq follow the firmware's Si4432 */
     uint32_t rx_events_hb; /* rx_events snapshot for the RX heartbeat delta */
+    uint32_t rx_dropped_hb; /* rx_dropped snapshot for the RX heartbeat delta */
     uint32_t rx_frames_hb; /* rx_frames snapshot for the RX heartbeat delta */
+    uint32_t rx_gate_open_hb;
+    uint32_t rx_gate_close_hb;
     uint8_t si_modtyp; /* last REG[0x71] modtyp[1:0] seen (0=unmod 1=OOK 2=FSK 3=GFSK) */
     uint8_t si_dtmod; /* last REG[0x71] dtmod[7:6] (SiDtMod); DIAGNOSTIC only */
     uint32_t si_devi_hz; /* FSK frequency deviation derived from REG[0x71]/0x72 */
     CcPreset cc_preset; /* which CC1101 custom preset is loaded right now */
+    uint8_t cc_fsk_deviation_reg; /* selected CC1101 DEVIATN value */
 
     /* NOTE: the old Si4432 PACKET/FIFO bridge (si_tx_fifo / si_rx_fifo and the
      * fifo_tx_transmit / fifo_rx_poll functions) was REMOVED. DYN_HW_D605.md
@@ -740,6 +808,14 @@ typedef struct {
 
     Storage* storage; /* kept for the flash cache (streams pages at runtime) */
 } AppState;
+
+/* ThumbCore counts each completed instruction. Treat the instruction currently
+ * executing as +1 so MMIO callbacks see a consistent virtual timestamp whether
+ * the per-instruction hook is enabled or bypassed. */
+static uint64_t emu_insn_now(const AppState* app) {
+    if(!app->cpu) return app->ninsn;
+    return app->cpu->cycles + 1u;
+}
 
 static volatile uint32_t s_fb_cb_inflight = 0;
 
@@ -849,12 +925,14 @@ static uint32_t mmio_read(void* ctx, uint32_t addr, int size) {
                 /* Faithful CNT: advances with time (instructions), wraps at TOP.
                  * CONSISTENT per-delay cost -> smooth pacing (no stutter). */
                 uint32_t top = app->timer_top[tn] ? app->timer_top[tn] : 0xFFFFu;
-                uint64_t elapsed = (app->ninsn - app->timer_t0[tn]) * (uint64_t)app->timer_rate[tn];
+                uint64_t elapsed =
+                    (emu_insn_now(app) - app->timer_t0[tn]) * (uint64_t)app->timer_rate[tn];
                 v = (uint32_t)(elapsed % ((uint64_t)top + 1u));
             }
         } else if(sub == 0x3C && tn < 4) { /* TOP reached? (IF overflow proxy) */
             uint32_t top = app->timer_top[tn] ? app->timer_top[tn] : 0xFFFFu;
-            uint64_t elapsed = (app->ninsn - app->timer_t0[tn]) * (uint64_t)app->timer_rate[tn];
+            uint64_t elapsed =
+                (emu_insn_now(app) - app->timer_t0[tn]) * (uint64_t)app->timer_rate[tn];
             v = (elapsed >= top) ? 1u : 0u;
         }
     }
@@ -1047,7 +1125,7 @@ static void led_mirror(AppState* app, uint32_t port) {
     furi_hal_light_set(LightRed, on ? 0xFF : 0x00);
     if(!app->led_logged) {
         app->led_logged = true;
-        FURI_LOG_I(TAG, "LED: port%u pin%u -> %s (first toggle; subsequent are silent)",
+        FURI_LOG_D(TAG, "LED: port%u pin%u -> %s (first toggle; subsequent are silent)",
                    (unsigned)app->prof->led_port, (unsigned)app->prof->led_pin,
                    on ? "ON" : "OFF");
     }
@@ -1117,13 +1195,14 @@ static void buzz_detect_gpio(AppState* app, uint32_t port, uint32_t pin_mask, ui
             app->buzz_cand_port = (uint8_t)port;
             app->buzz_cand_pin = (uint8_t)pin;
             app->buzz_edges = 1;
-            app->buzz_last_edge_insn = app->ninsn;
+            app->buzz_last_edge_insn = emu_insn_now(app);
             app->buzz_period_insn = 0;
             continue;
         }
         /* same candidate toggled again: measure the half-period */
-        uint64_t dinsn = app->ninsn - app->buzz_last_edge_insn;
-        app->buzz_last_edge_insn = app->ninsn;
+        uint64_t now_insn = emu_insn_now(app);
+        uint64_t dinsn = now_insn - app->buzz_last_edge_insn;
+        app->buzz_last_edge_insn = now_insn;
         if(dinsn == 0 || dinsn > BUZZ_GAP_INSN) {
             /* too slow / stale -> restart the burst (not a tone) */
             app->buzz_edges = 1;
@@ -1135,7 +1214,7 @@ static void buzz_detect_gpio(AppState* app, uint32_t port, uint32_t pin_mask, ui
         if(app->buzz_edges >= BUZZ_MIN_EDGES) {
             if(!app->buzz_logged) {
                 app->buzz_logged = true;
-                FURI_LOG_I(TAG,
+                FURI_LOG_D(TAG,
                            "BUZZER? gpio port%u pin%u toggling (%lu edges, ~%lu insn/half) "
                            "-- CONFIRM on hardware",
                            (unsigned)port, (unsigned)pin,
@@ -1189,7 +1268,7 @@ static void mmio_write(void* ctx, uint32_t addr, uint32_t val, int size) {
             if(sub == 0x24) {
                 /* firmware writes CNT (usually 0): re-anchor t0 so CNT restarts
                  * counting from here (faithful free-running model). */
-                app->timer_t0[tn] = app->ninsn;
+                app->timer_t0[tn] = emu_insn_now(app);
             } else if(sub == 0x3C) {
                 app->timer_top[tn] = val ? val : 0xFFFFu; /* TOP (wrap) */
             } else if(!app->buzz_timer_logged &&
@@ -1202,7 +1281,7 @@ static void mmio_write(void* ctx, uint32_t addr, uint32_t val, int size) {
                  * Logged ONCE so a human can correlate it with an audible beep on
                  * real hardware and confirm the exact register. */
                 app->buzz_timer_logged = true;
-                FURI_LOG_I(TAG,
+                FURI_LOG_D(TAG,
                            "BUZZER? timer%u write 0x%08lX=0x%lX (sub=0x%03lX, not CNT/TOP) "
                            "-- possible PWM tone; CONFIRM on hardware",
                            (unsigned)tn, (unsigned long)addr, (unsigned long)val,
@@ -1333,7 +1412,7 @@ static void nav_step(AppState* app, uint32_t a) {
  * active at a time. */
 static void code_hook(void* ctx, uint32_t pc) {
     AppState* app = (AppState*)ctx;
-    app->ninsn++;
+    app->ninsn = emu_insn_now(app);
     app->pc = pc;
     if(!app->unlocked && pc == app->prof->unlock_pc) {
         app->unlocked = 1;
@@ -1347,28 +1426,40 @@ static void code_hook(void* ctx, uint32_t pc) {
 /* A burst of instructions with WFI/tick + EXC_RETURN handling. Replica of
  * run_burst from pandora_tui.py. */
 static void run_burst(AppState* app, uint32_t count) {
+    ThumbCore* cpu = app->cpu;
+    ThumbHook saved_hook = cpu->hook;
+    void* saved_hook_ctx = cpu->hook_ctx;
+    bool skip_hook = app->unlocked && !app->nav_active && !app->knock_active;
+    uint64_t now_insn = emu_insn_now(app);
     bool app_running = cur_vtor(app) >= 0x8000u;
     bool stuck_wfi = app_running && (app->next_pc & ~1u) == (app->wfi_pc_hint & ~1u);
     bool want_tick = app_running &&
-                     (stuck_wfi || (app->ninsn - app->last_tick_insn) > 20000ull);
+                     (stuck_wfi || (now_insn - app->last_tick_insn) > 20000ull);
     if(want_tick && !app->in_irq) {
-        app->last_tick_insn = app->ninsn;
+        app->last_tick_insn = now_insn;
         nvic_tick(app);
     }
-    thumb_set_reg(app->cpu, 15, app->next_pc);
+    if(skip_hook) thumb_set_hook(cpu, NULL, NULL);
+    thumb_set_reg(cpu, 15, app->next_pc);
     for(uint32_t i = 0; i < count; i++) {
-        int rc = thumb_step(app->cpu);
+        int rc = thumb_step(cpu);
         if(rc < 0) break;
-        uint32_t pc = thumb_get_reg(app->cpu, 15);
+        uint32_t pc = thumb_get_reg(cpu, 15);
         /* EXC_RETURN: the ISR finished (bx lr with 0xFFFFFFFx) */
         if((pc & 0xFFFFFFF0u) == 0xFFFFFFF0u) {
-            thumb_exc_return(app->cpu, pc);
+            thumb_exc_return(cpu, pc);
             app->in_irq = 0;
-            app->next_pc = thumb_get_reg(app->cpu, 15);
+            app->next_pc = thumb_get_reg(cpu, 15);
+            if(skip_hook) thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
+            app->ninsn = emu_insn_now(app);
+            app->pc = app->next_pc & ~1u;
             return;
         }
     }
-    app->next_pc = thumb_get_reg(app->cpu, 15);
+    app->next_pc = thumb_get_reg(cpu, 15);
+    if(skip_hook) thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
+    app->ninsn = emu_insn_now(app);
+    app->pc = app->next_pc & ~1u;
 }
 
 static void tap(AppState* app, int btn) {
@@ -1425,7 +1516,7 @@ static uint32_t fb_hash(AppState* app) {
  * Returns true if the injection completed (press+hold+release). */
 static bool nav_button(AppState* app, int btn, bool hold) {
     if(btn < 0 || btn >= BTN_COUNT) return false;
-    FURI_LOG_I(TAG, "nav_button: btn=%d hold=%d unlocked=%d", btn, hold, app->unlocked);
+    FURI_LOG_D(TAG, "nav_button: btn=%d hold=%d unlocked=%d", btn, hold, app->unlocked);
     uint8_t port, pin;
     btn_port_pin(app->prof, btn, &port, &pin);
     app->nav_btn = (uint8_t)btn;
@@ -1436,14 +1527,13 @@ static bool nav_button(AppState* app, int btn, bool hold) {
     app->nav_reads_target = hold ? NAV_LONG_READS : NAV_HOLD_READS;
     app->nav_active = 1;
 
-    /* The press loop exits when the firmware dispatches the release
-     * (nav_phase==2). Burst 50000 (reverted from a 25000 fluidity tweak that
-     * could alter how the firmware times the press and spuriously trigger
-     * AUTO/JAMM when entering a submenu). */
+    /* The press loop exits as soon as the firmware dispatches the release.
+     * Small slices bound overshoot without changing the number of GPIO reads
+     * used to represent a short or long press. */
     uint64_t done = 0;
     while(app->nav_phase != 2 && done < NAV_BUDGET_INSN) {
-        run_burst(app, 50000);
-        done += 50000;
+        run_burst(app, NAV_PRESS_BURST);
+        done += NAV_PRESS_BURST;
     }
     app->nav_active = 0;
     /* guarantee release (in case the budget ran out mid-hold) */
@@ -1452,13 +1542,8 @@ static bool nav_button(AppState* app, int btn, bool hold) {
 
     bool completed = (app->nav_phase == 2);
 
-    /* adaptive settle: stop as soon as the firmware redraws the framebuffer.
-     * FLUIDITY: the settle burst is reduced 60000 -> NAV_SETTLE_BURST (30000) so
-     * the fb-change check runs twice as often. With NAV_SETTLE_MIN_INSN=30000 the
-     * first burst already clears the floor, so a redraw is now cut at ~0.43s
-     * instead of after a full 60000 burst. This only trims the WAIT after the UI
-     * has already redrawn; it does NOT skip any render (render_oled + canvas_commit
-     * still run every frame in the main loop) and does NOT reduce useful insn/s. */
+    /* Check the committed screen often and stop close to the first completed
+     * redraw instead of running another large instruction chunk. */
     uint32_t prev = fb_hash(app);
     done = 0;
     bool redrew = false;
@@ -1469,7 +1554,7 @@ static bool nav_button(AppState* app, int btn, bool hold) {
         if(cur != prev && done >= NAV_SETTLE_MIN_INSN) { redrew = true; break; } /* UI redrew */
         prev = cur;
     }
-    FURI_LOG_I(TAG, "nav_button: done btn=%d completed=%d redrew=%d settle_insn=%llu",
+    FURI_LOG_D(TAG, "nav_button: done btn=%d completed=%d redrew=%d settle_insn=%llu",
                btn, completed, redrew, (unsigned long long)done);
     return completed;
 }
@@ -1710,6 +1795,11 @@ static LoadResult flatten_firmware(AppState* app, Storage* storage, const char* 
     File* out = storage_file_alloc(storage);
     LoadResult res = LoadIoError;
     bool out_open = false;
+    if(!f || !out) {
+        if(f) storage_file_free(f);
+        if(out) storage_file_free(out);
+        return LoadNoMem;
+    }
     do {
         if(!storage_file_open(f, path, FSAM_READ, FSOM_OPEN_EXISTING)) break;
         uint64_t fsize = storage_file_size(f);
@@ -1813,6 +1903,7 @@ static LoadResult fc_init(AppState* app) {
     fc->fully_resident = false;
 
     fc->file = storage_file_alloc(app->storage);
+    if(!fc->file) return LoadNoMem;
     if(!storage_file_open(fc->file, PA_FLASH_BIN, FSAM_READ, FSOM_OPEN_EXISTING)) {
         FURI_LOG_E(TAG, "flash cache: cannot open %s", PA_FLASH_BIN);
         return LoadIoError;
@@ -1826,11 +1917,12 @@ static LoadResult fc_init(AppState* app) {
     fc->slot_use = (uint32_t*)safe_malloc(cap * sizeof(uint32_t));
     if(!fc->slots || !fc->slot_page || !fc->slot_use) return LoadNoMem;
 
-    /* Allocate as many 4KB slots as fit, keeping a heap reserve free for the GUI
-     * takeover/system. Degrade the reserve (10K -> 8K -> 6K) if the first pass
-     * can't reach FLASH_MIN_SLOTS -- same strategy as FlipperGB's rom_load. Each
-     * slot is its own small malloc (no big contiguous block). */
-    static const size_t reserve_ladder[3] = {FLASH_HEAP_RESERVE, 8u * 1024u, 6u * 1024u};
+    /* Allocate as many 4KB slots as fit, keeping runtime memory for the RX queue,
+     * GUI direct draw, and system services. Degrade the reserve (14K -> 12K ->
+     * 10K) only if needed to obtain one cache slot.
+     * Each slot is its own small malloc (no big contiguous block). */
+    static const size_t reserve_ladder[3] = {
+        FLASH_HEAP_RESERVE, 12u * 1024u, 10u * 1024u};
     for(int step = 0; step < 3; step++) {
         size_t reserve = reserve_ladder[step];
         while(fc->num_slots < cap) {
@@ -1898,6 +1990,27 @@ static void fc_deinit(FlashCache* fc) {
     fc->num_slots = 0;
 }
 
+/* Keep LRU timestamps ordered after long sessions. A wrap to zero would make
+ * freshly used pages look oldest and cause avoidable SD reads. */
+static void fc_lru_renormalize(FlashCache* fc) {
+    for(uint16_t i = 0; i < fc->num_slots; i++) {
+        uint32_t rank = 1;
+        for(uint16_t j = 0; j < fc->num_slots; j++) {
+            if(fc->slot_use[j] < fc->slot_use[i] ||
+               (fc->slot_use[j] == fc->slot_use[i] && j < i)) {
+                rank++;
+            }
+        }
+        fc->slot_use[i] = rank;
+    }
+    fc->use_counter = fc->num_slots;
+}
+
+static uint32_t fc_lru_next(FlashCache* fc) {
+    if(fc->use_counter == UINT32_MAX) fc_lru_renormalize(fc);
+    return ++fc->use_counter;
+}
+
 /* Streams `page` into the LRU victim slot and returns its index. Eviction is
  * plain LRU (oldest slot_use). Unlike FlipperGB there are NO mapped-pointer
  * invariants to protect here: every flash access resolves a single byte and
@@ -1918,7 +2031,7 @@ static uint16_t fc_fill(FlashCache* fc, uint32_t page) {
         memset(fc->slots[lru], 0xFF, FLASH_PAGE_SIZE);
     }
     fc->slot_page[lru] = page;
-    fc->slot_use[lru] = ++fc->use_counter;
+    fc->slot_use[lru] = fc_lru_next(fc);
     return lru;
 }
 
@@ -1928,7 +2041,7 @@ static const uint8_t* fc_page_ptr(FlashCache* fc, uint32_t page) {
     if(fc->fully_resident) return fc->slots[page]; /* slot i == page i */
     for(uint16_t i = 0; i < fc->num_slots; i++) {
         if(fc->slot_page[i] == page) {
-            fc->slot_use[i] = ++fc->use_counter;
+            fc->slot_use[i] = fc_lru_next(fc);
             return fc->slots[i];
         }
     }
@@ -2013,6 +2126,25 @@ static bool cc_preset_for_modtyp(uint8_t modtyp) {
     return (modtyp == 2 || modtyp == 3);
 }
 
+/* The CC1101 exposes three useful async 2-FSK presets in this firmware tree.
+ * Pick the closest available deviation to the value programmed by the Si4432. */
+static uint8_t cc1101_fsk_deviation_reg(uint32_t requested_hz) {
+    static const uint32_t deviations[] = {2380u, 12695u, 47607u};
+    static const uint8_t registers[] = {0x04u, 0x30u, 0x47u};
+    if(requested_hz == 0) requested_hz = deviations[2];
+    uint8_t best = registers[0];
+    uint32_t best_error = UINT32_MAX;
+    for(size_t i = 0; i < sizeof(deviations) / sizeof(deviations[0]); i++) {
+        uint32_t error = requested_hz > deviations[i] ?
+                             requested_hz - deviations[i] : deviations[i] - requested_hz;
+        if(error < best_error) {
+            best_error = error;
+            best = registers[i];
+        }
+    }
+    return best;
+}
+
 static void radio_init(AppState* app) {
     app->frequency = 433920000; /* default / fallback until the firmware sets it */
     furi_hal_subghz_reset();
@@ -2028,6 +2160,7 @@ static void radio_init(AppState* app) {
     app->si_modtyp = 1; /* assume OOK until the firmware says otherwise */
     app->si_dtmod = DtModDirectGpio; /* assume bit-bang until REG[0x71] says FIFO */
     app->cc_preset = CcPresetOok;
+    app->cc_fsk_deviation_reg = 0;
     FURI_LOG_I(TAG, "CC1101 init OOK650 @%lu Hz (RF follows firmware)",
                (unsigned long)app->frequency);
 }
@@ -2042,7 +2175,10 @@ static void rf_reapply_preset(AppState* app) {
     if(!app->radio_on) return;
     bool want_fsk = cc_preset_for_modtyp(app->si_modtyp);
     CcPreset want = want_fsk ? CcPreset2Fsk : CcPresetOok;
-    if(want == app->cc_preset) return; /* already loaded: nothing to do */
+    uint8_t deviation_reg = cc1101_fsk_deviation_reg(app->si_devi_hz);
+    if(want == app->cc_preset &&
+       (!want_fsk || deviation_reg == app->cc_fsk_deviation_reg))
+        return; /* already loaded: nothing to do */
 
     /* Loading a custom preset must happen on an idle radio. */
     if(app->tx_active) {
@@ -2054,15 +2190,31 @@ static void rf_reapply_preset(AppState* app) {
         /* keep app->rx_running as-is: the caller decides whether to restart */
     }
     furi_hal_subghz_idle();
-    furi_hal_subghz_load_custom_preset(want_fsk ? PRESET_2FSK : PRESET_OOK650);
+    if(want_fsk) {
+        uint8_t preset[sizeof(PRESET_2FSK)];
+        memcpy(preset, PRESET_2FSK, sizeof(preset));
+        for(size_t i = 0; preset[i] != 0; i += 2) {
+            if(preset[i] == 0x15) {
+                preset[i + 1] = deviation_reg;
+                break;
+            }
+        }
+        furi_hal_subghz_load_custom_preset(preset);
+    } else {
+        furi_hal_subghz_load_custom_preset(PRESET_OOK650);
+    }
     furi_hal_subghz_set_frequency_and_path(app->frequency);
     furi_hal_subghz_idle();
     app->cc_preset = want;
+    app->cc_fsk_deviation_reg = want_fsk ? deviation_reg : 0;
     static const char* const MODN[4] = {"OOK(unmod)", "OOK", "FSK", "GFSK"};
     FURI_LOG_I(TAG,
                "RF: modulation %s (REG71=0x%02X devi=%lu Hz) -> CC1101 preset %s",
                MODN[app->si_modtyp & 3], app->si.regs[0x71],
-               (unsigned long)app->si_devi_hz, want_fsk ? "2FSK" : "OOK650");
+               (unsigned long)app->si_devi_hz,
+               want_fsk ? (deviation_reg == 0x04 ? "2FSK/2.38k" :
+                           deviation_reg == 0x30 ? "2FSK/12.7k" : "2FSK/47.6k") :
+                          "OOK650");
 }
 
 /* --------------------------------------------- Si4432 -> CC1101 freq mapping
@@ -2180,11 +2332,7 @@ static void rf_follow_apply_mode(AppState* app, int new_mode) {
             /* A TX frame is being captured / is pending / is in flight. Close the
              * capture but STAY in RfModeTx so tx_bridge_flush can replay & idle
              * the CC1101 when async_tx completes. Do not force idle here. */
-            if(app->tx_capturing) {
-                app->tx_capturing = false;
-                FURI_LOG_I(TAG, "RF: firmware TX end (follow) %lu edges",
-                           (unsigned long)app->tx_edges_frame);
-            }
+            if(app->tx_capturing) tx_on_si_mode(app, new_mode);
             /* rf_mode left as RfModeTx on purpose */
         } else {
             app->rf_mode = RfModeOff;
@@ -2219,15 +2367,34 @@ static void tx_on_si_mode(AppState* app, int new_mode) {
         /* TX waveform is bit-banged on PB3 (tx_data pin), not PB0 (RX-data). */
         app->tx_last_level =
             (app->gpio_dout[app->prof->tx_data_port] >> app->prof->tx_data_pin) & 1u;
-        app->tx_last_insn = app->ninsn;
+        app->tx_last_insn = emu_insn_now(app);
         app->tx_edges_frame = 0;
+        app->tx_edges_dropped = 0;
         FURI_LOG_I(TAG, "RF: firmware rf_tx_on -> capturing TX-DATA pin (B%u.%u)",
                    app->prof->tx_data_port, app->prof->tx_data_pin);
     } else { /* IDLE/READY/RX: end of the frame */
         if(app->tx_capturing) {
+            /* The last GPIO level remains on the pin after its final toggle.
+             * Include that trailing mark/space so replay does not truncate the
+             * frame at the final edge. */
+            uint64_t elapsed = emu_insn_now(app) - app->tx_last_insn;
+            uint64_t scaled = (elapsed * ARM_INSN_US_NUM) / ARM_INSN_US_DEN;
+            uint32_t dur_us = scaled > UINT32_MAX ? UINT32_MAX : (uint32_t)scaled;
+            if(dur_us == 0) dur_us = 1;
+            uint32_t head = app->tx_head;
+            uint32_t next = (head + 1) % TX_RING_LEN;
+            if(next != app->tx_tail) {
+                app->tx_ring[head].level = app->tx_last_level;
+                app->tx_ring[head].duration = dur_us;
+                app->tx_head = next;
+                app->tx_edges_frame++;
+            } else {
+                app->tx_edges_dropped++;
+            }
             app->tx_capturing = false;
-            FURI_LOG_I(TAG, "RF: firmware TX end (%lu edges captured)",
-                       (unsigned long)app->tx_edges_frame);
+            FURI_LOG_I(TAG, "RF: firmware TX end (%lu edges captured, %lu dropped)",
+                       (unsigned long)app->tx_edges_frame,
+                       (unsigned long)app->tx_edges_dropped);
         }
     }
 }
@@ -2237,10 +2404,11 @@ static void tx_on_si_mode(AppState* app, int new_mode) {
 static void tx_capture_data_edge(AppState* app, bool level) {
     if(!app->tx_capturing) return;
     if(level == app->tx_last_level) return; /* no edge */
-    uint64_t now = app->ninsn;
+    uint64_t now = emu_insn_now(app);
     uint64_t dins = now - app->tx_last_insn;
     app->tx_last_insn = now;
-    uint32_t dur_us = (uint32_t)((dins * ARM_INSN_US_NUM) / ARM_INSN_US_DEN);
+    uint64_t scaled = (dins * ARM_INSN_US_NUM) / ARM_INSN_US_DEN;
+    uint32_t dur_us = scaled > UINT32_MAX ? UINT32_MAX : (uint32_t)scaled;
     if(dur_us == 0) dur_us = 1;
     uint32_t head = app->tx_head;
     uint32_t next = (head + 1) % TX_RING_LEN;
@@ -2249,6 +2417,8 @@ static void tx_capture_data_edge(AppState* app, bool level) {
         app->tx_ring[head].duration = dur_us;
         app->tx_head = next;
         app->tx_edges_frame++;
+    } else {
+        app->tx_edges_dropped++;
     }
     app->tx_last_level = level;
 }
@@ -2277,7 +2447,7 @@ static void tx_bridge_flush(AppState* app) {
         return;
     }
     uint32_t pending = (app->tx_head + TX_RING_LEN - app->tx_tail) % TX_RING_LEN;
-    if(pending < 16) return; /* wait for a reasonable burst */
+    if(pending == 0) return;
     if(app->tx_capturing) return; /* frame still being captured: wait for the close */
     if(!furi_hal_subghz_is_tx_allowed(app->frequency)) {
         FURI_LOG_E(TAG, "TX NOT allowed @%lu Hz; dropping %lu edges",
@@ -2311,18 +2481,137 @@ static void tx_bridge_flush(AppState* app) {
 
 /* ===================================================================== RX bridge */
 
-/* CC1101 callback (runs in IRQ): enqueues the edge. Do NOT block. */
+/* Publish every captured pulse from the CC1101 ISR without filtering/blocking. */
+static void radio_rx_enqueue(AppState* app, const RfEdge* e) {
+    uint32_t head = __atomic_load_n(&app->rx_head, __ATOMIC_RELAXED);
+    uint32_t tail = __atomic_load_n(&app->rx_tail, __ATOMIC_ACQUIRE);
+    if((uint32_t)(head - tail) >= RX_RING_LEN) {
+        __atomic_fetch_add(&app->rx_dropped, 1u, __ATOMIC_RELAXED);
+        return;
+    }
+    RxEdge compact = {
+        .duration = (uint16_t)e->duration,
+        .level = e->level ? 1u : 0u,
+        .gate_open = __atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_RELAXED),
+    };
+    app->rx_ring[head % RX_RING_LEN] = compact;
+    __atomic_store_n(&app->rx_head, head + 1u, __ATOMIC_RELEASE);
+}
+
+static void rx_preroll_push(AppState* app, const RxEdge* edge);
+
+/* Paired with radio_rx_enqueue's release store. Avoids the RTOS queue/event
+ * loop notification on every captured edge in the high-rate TIM2 ISR. */
+static bool radio_rx_dequeue(AppState* app, RxEdge* e) {
+    uint32_t tail = __atomic_load_n(&app->rx_tail, __ATOMIC_RELAXED);
+    uint32_t head = __atomic_load_n(&app->rx_head, __ATOMIC_ACQUIRE);
+    if(tail == head) return false;
+    *e = app->rx_ring[tail % RX_RING_LEN];
+    __atomic_store_n(&app->rx_tail, tail + 1u, __ATOMIC_RELEASE);
+    return true;
+}
+
+/* CC1101 callback runs in the capture IRQ. RSSI is sampled by the emulator
+ * thread; the IRQ only snapshots the gate state and appends the edge. */
 static void radio_rx_callback(bool level, uint32_t duration, void* context) {
     AppState* app = (AppState*)context;
     RfEdge e = {.level = level, .duration = duration};
-    /* DIAG: count raw edges the CC1101 delivers from the air. If this stays 0
-     * while you press a real remote, the radio is not receiving on this
-     * frequency/modulation (check 433.92 OOK vs your remote's band). If it rises
-     * but no "RX frame decoded" appears, the firmware demodulator rejected it
-     * (wrong protocol: Pandora expects KeeLoq/its own fixed-code families, which
-     * a Princeton/PT2262 remote is NOT). Logged at debug, throttled. */
-    app->rx_events++;
-    furi_message_queue_put(app->rx_queue, &e, 0);
+    __atomic_fetch_add(&app->rx_events, 1u, __ATOMIC_RELAXED);
+    bool gate = __atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_ACQUIRE) != 0;
+    if(gate) {
+        radio_rx_enqueue(app, &e);
+        return;
+    }
+
+    /* After RSSI closes, forward a bounded 100 ms tail. Idle noise stays in
+     * the tiny pre-roll buffer and cannot fill the main capture ring. */
+    uint32_t post = __atomic_load_n(&app->rx_postroll_isr_us, __ATOMIC_RELAXED);
+    if(post) {
+        radio_rx_enqueue(app, &e);
+        post = duration >= post ? 0u : post - duration;
+        __atomic_store_n(&app->rx_postroll_isr_us, post, __ATOMIC_RELAXED);
+    }
+
+    if(!__atomic_load_n(&app->rx_preroll_frozen, __ATOMIC_ACQUIRE)) {
+        RxEdge compact = {
+            .duration = (uint16_t)duration,
+            .level = level ? 1u : 0u,
+            .gate_open = 0u,
+        };
+        rx_preroll_push(app, &compact);
+        __atomic_fetch_add(&app->rx_idle_edges, 1u, __ATOMIC_RELAXED);
+    }
+}
+
+/* RSSI opens/closes a software squelch around the raw edge stream. Keep this
+ * out of the capture IRQ: get_rssi() performs an SPI transaction. */
+static void rx_rssi_update(AppState* app) {
+    if(!app->rx_running) return;
+    uint32_t now = furi_get_tick();
+    if(app->rx_rssi_sample_tick &&
+       (uint32_t)(now - app->rx_rssi_sample_tick) < RX_RSSI_POLL_MS)
+        return;
+    app->rx_rssi_sample_tick = now;
+    app->rx_rssi_dbm = furi_hal_subghz_get_rssi();
+
+    bool gate_open = __atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_RELAXED) != 0;
+    if(!app->rx_rssi_initialized) {
+        /* Seed from the actual idle environment instead of assuming a fixed
+         * noise floor. Subsequent samples decide whether a signal rose above it. */
+        app->rx_noise_floor_dbm = app->rx_rssi_dbm;
+        app->rx_rssi_initialized = true;
+        app->rx_gate_open_dbm = app->rx_noise_floor_dbm + RX_RSSI_NOISE_MARGIN_DB;
+        if(app->rx_gate_open_dbm < RX_RSSI_MIN_OPEN_DBM)
+            app->rx_gate_open_dbm = RX_RSSI_MIN_OPEN_DBM;
+        FURI_LOG_I(TAG, "RX RSSI baseline rssi=%.1f open=%.1f dBm",
+                   (double)app->rx_rssi_dbm, (double)app->rx_gate_open_dbm);
+        return;
+    }
+    if(!gate_open) {
+        /* Follow a changing noise floor slowly; a signal peak must not raise it
+         * quickly enough to make the rest of that burst disappear. */
+        float delta = app->rx_rssi_dbm - app->rx_noise_floor_dbm;
+        app->rx_noise_floor_dbm += delta * (delta < 0.0f ? 0.20f : 0.015f);
+    }
+
+    float open_threshold = app->rx_noise_floor_dbm + RX_RSSI_NOISE_MARGIN_DB;
+    if(open_threshold < RX_RSSI_MIN_OPEN_DBM) open_threshold = RX_RSSI_MIN_OPEN_DBM;
+    app->rx_gate_open_dbm = open_threshold;
+
+    if(!gate_open) {
+        if(app->rx_rssi_dbm >= open_threshold) {
+            app->rx_gate_below_tick = 0;
+            app->rx_gate_open_count++;
+            __atomic_store_n(&app->rx_gate_open_isr, 1u, __ATOMIC_RELEASE);
+            __atomic_store_n(&app->rx_preroll_frozen, 1u, __ATOMIC_RELEASE);
+            FURI_LOG_I(TAG,
+                       "RX RSSI gate OPEN rssi=%.1f floor=%.1f threshold=%.1f preroll=%u",
+                       (double)app->rx_rssi_dbm, (double)app->rx_noise_floor_dbm,
+                       (double)open_threshold, (unsigned)app->rx_preroll_count);
+        }
+    } else {
+        float close_threshold = open_threshold - RX_RSSI_HYSTERESIS_DB;
+        if(app->rx_rssi_dbm < close_threshold) {
+            if(app->rx_gate_below_tick == 0) app->rx_gate_below_tick = now;
+            if((uint32_t)(now - app->rx_gate_below_tick) >= RX_RSSI_HANG_MS) {
+                __atomic_store_n(&app->rx_preroll_frozen, 1u, __ATOMIC_RELEASE);
+                app->rx_preroll_head = 0;
+                app->rx_preroll_count = 0;
+                __atomic_store_n(&app->rx_postroll_isr_us, RX_POSTROLL_MS * 1000u,
+                                 __ATOMIC_RELEASE);
+                __atomic_store_n(&app->rx_gate_open_isr, 0u, __ATOMIC_RELEASE);
+                __atomic_store_n(&app->rx_preroll_frozen, 0u, __ATOMIC_RELEASE);
+                app->rx_gate_close_count++;
+                app->rx_gate_below_tick = 0;
+                FURI_LOG_I(TAG,
+                           "RX RSSI gate CLOSE rssi=%.1f floor=%.1f threshold=%.1f hold=%u ms",
+                           (double)app->rx_rssi_dbm, (double)app->rx_noise_floor_dbm,
+                           (double)close_threshold, RX_RSSI_HANG_MS);
+            }
+        } else {
+            app->rx_gate_below_tick = 0;
+        }
+    }
 }
 
 /* Executes a firmware subroutine (addr) as call() does in arm_pandora.py:
@@ -2340,6 +2629,16 @@ static void call_subroutine(AppState* app, uint32_t addr, uint32_t max_insn) {
     uint32_t s_r0 = thumb_get_reg(cpu, 0);
     uint32_t s_r1 = thumb_get_reg(cpu, 1);
     uint8_t s_halted = cpu->halted;
+    ThumbHook s_hook = cpu->hook;
+    void* s_hook_ctx = cpu->hook_ctx;
+
+    /* RX demodulation calls this once for every RF edge. The normal code hook
+     * updates UI/navigation state per instruction, but neither FSM is active
+     * during an RX ISR. Skipping that callback on this hot path saves a function
+     * call and several branches for every emulated instruction. Keep the
+     * instruction/time counters coherent from the core's cycle counter. */
+    bool count_without_hook = app->unlocked && !app->nav_active && !app->knock_active;
+    if(count_without_hook) thumb_set_hook(cpu, NULL, NULL);
 
     thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
     thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
@@ -2347,12 +2646,19 @@ static void call_subroutine(AppState* app, uint32_t addr, uint32_t max_insn) {
     cpu->halted = 0;
 
     for(uint32_t i = 0; i < max_insn; i++) {
-        uint32_t pc = thumb_get_reg(cpu, 15) & ~1u;
+        /* This is the hot path for every received RF pulse. r[15] is public in
+         * ThumbCore; read it directly to avoid an out-of-line accessor per insn. */
+        uint32_t pc = cpu->r[15] & ~1u;
         if(pc == (ARM_CALL_SENTINEL & ~1u)) break;
         if(thumb_step(cpu) < 0) break;
     }
 
     /* restore */
+    if(count_without_hook) {
+        app->ninsn = emu_insn_now(app);
+        app->pc = thumb_get_reg(cpu, 15) & ~1u;
+    }
+    thumb_set_hook(cpu, s_hook, s_hook_ctx);
     thumb_set_reg(cpu, 0, s_r0);
     thumb_set_reg(cpu, 1, s_r1);
     thumb_set_reg(cpu, 13, s_sp);
@@ -2366,15 +2672,14 @@ static void rx_wr8(AppState* app, uint32_t addr, uint8_t v) {
     thumb_write_mem(app->cpu, addr, v, 1);
 }
 
-/* Prepares the receiver RAM state as rf_rx_on would leave it (prime_rx from
- * arm_pandora.py): active gate, mode, shift-chains at the idle level. */
-static void rx_prime(AppState* app, uint8_t mode, bool init_level) {
+/* Prepare transient receiver state, while preserving rx_mode because the
+ * firmware owns that selector (including its AM/FM or decoder choice). */
+static void rx_prime(AppState* app, bool init_level) {
     const ArmProfile* p = app->prof;
     uint8_t lvl = init_level ? 1 : 0;
     /* clear the RX structure (0x40 bytes) */
     for(uint32_t o = 0; o < 0x40; o++) rx_wr8(app, p->rx_struct + o, 0);
     rx_wr8(app, p->rx_gate, 1); /* [+0xF] active gate (!=0xFF) */
-    rx_wr8(app, p->rx_mode, mode); /* decoder selector */
     rx_wr8(app, p->rx_pending, 0); /* data present (!=0xFF) */
     rx_wr8(app, p->rx_state, 0);
     for(uint32_t o = 0x10; o < 0x1C; o++) rx_wr8(app, p->rx_struct + o, lvl);
@@ -2405,25 +2710,255 @@ static bool rx_feed_edge(AppState* app, bool level, uint32_t dur_us) {
     /* shift-chain + filtered levels at the PREVIOUS level to force edge
      * detection (see calibration note in arm_pandora.py / CAL_arm_decoder). */
     uint8_t pl = prev ? 1 : 0;
-    for(uint32_t o = 0x10; o < 0x1C; o++) rx_wr8(app, p->rx_struct + o, pl);
-    rx_wr8(app, p->rx_struct + 9, pl);
-    rx_wr8(app, p->rx_struct + 0xA, pl);
+    /* These profile addresses are fixed inside emulated RAM. Write the filter
+     * history directly: this runs once per RF pulse, so routing each byte
+     * through thumb_write_mem's region checks needlessly costs a dozen calls. */
+    uint32_t rx_off = p->rx_struct - PA_RAM_BASE;
+    memset(app->ram + rx_off + 0x10u, pl, 0x0Cu);
+    app->ram[rx_off + 9u] = pl;
+    app->ram[rx_off + 0xAu] = pl;
 
     app->rx_feeding = true;
-    /* The demod ISR normally returns via the call sentinel after only a few
-     * hundred/thousand insn (one edge of processing); 200000 is a SAFETY cap for
-     * the pathological "ISR never returns" case. It is deliberately left UNCHANGED
-     * -- lowering it risks clipping the final edge that decodes a full frame and
-     * would silently break RX decoding. The fluidity win for RX comes from the
-     * drain cap (48 edges/frame, below) and the throttled inject log, not from
-     * starving the ISR. */
+    /* 200000 is only a safety cap for the pathological "ISR never returns"
+     * case; lowering it risks clipping an edge that completes a frame. */
     call_subroutine(app, p->demod_isr, 200000);
     app->rx_feeding = false;
     app->rx_prev_level = level;
-    app->rx_events++;
+    app->rx_injected++;
 
-    uint8_t pend = (uint8_t)thumb_read_mem(app->cpu, p->rx_pending, 1);
-    return pend == 0xFF;
+    uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
+    return pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF;
+}
+
+static void rx_preroll_push(AppState* app, const RxEdge* edge) {
+    if(app->rx_preroll_count == (uint16_t)RX_PREROLL_LEN) {
+        __atomic_fetch_add(&app->rx_preroll_overwritten, 1u, __ATOMIC_RELAXED);
+    } else {
+        app->rx_preroll_count++;
+    }
+    app->rx_preroll[app->rx_preroll_head] = *edge;
+    app->rx_preroll_head = (uint16_t)((app->rx_preroll_head + 1u) % RX_PREROLL_LEN);
+}
+
+static bool rx_deliver_edge(AppState* app, const RxEdge* edge);
+
+static int8_t rx_spool_alloc(AppState* app) {
+    FS_Error mkdir_err = storage_common_mkdir(app->storage, PA_DATA_DIR);
+    if(mkdir_err != FSE_OK && mkdir_err != FSE_EXIST) {
+        FURI_LOG_E(TAG, "RX spool SD directory unavailable");
+        app->rx_spool_lost++;
+        return -1;
+    }
+    for(uint8_t i = 0; i < RX_SPOOL_SLOTS; i++) {
+        RxSpool* s = &app->rx_spool[i];
+        if(s->state != RxSpoolFree) continue;
+        if(!s->file) s->file = storage_file_alloc(app->storage);
+        if(!s->file) break;
+        snprintf(s->path, sizeof(s->path), PA_DATA_DIR "/rx_%c.bin", (char)('a' + i));
+        if(!storage_file_open(s->file, s->path, FSAM_WRITE, FSOM_CREATE_ALWAYS)) {
+            FURI_LOG_E(TAG, "RX spool open failed slot=%u", i);
+            continue;
+        }
+        s->state = RxSpoolWriting;
+        s->bytes = 0;
+        s->play_pos = 0;
+        s->order = ++app->rx_spool_order;
+        app->rx_spool_batch_count = 0;
+        app->rx_spool_writer = (int8_t)i;
+        app->rx_gate_sample_count = 0;
+        FURI_LOG_I(TAG, "RX spool burst #%lu start slot=%c",
+                   (unsigned long)app->rx_spool_bursts + 1u, (char)('A' + i));
+        return (int8_t)i;
+    }
+    FURI_LOG_E(TAG, "RX spool unavailable (both SD slots busy); burst cannot be preserved");
+    app->rx_spool_lost++;
+    return -1;
+}
+
+static bool rx_spool_flush(AppState* app) {
+    if(app->rx_spool_writer < 0 || app->rx_spool_batch_count == 0) return true;
+    RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_writer];
+    size_t bytes = (size_t)app->rx_spool_batch_count * sizeof(RxEdge);
+    if(storage_file_write(s->file, app->rx_spool_batch, bytes) != bytes) {
+        s->write_errors++;
+        FURI_LOG_E(TAG, "RX spool write failed slot=%c at=%lu bytes=%lu",
+                   (char)('A' + app->rx_spool_writer), (unsigned long)s->bytes,
+                   (unsigned long)bytes);
+        storage_file_close(s->file);
+        s->state = RxSpoolFailed; /* leave partial file on SD for diagnosis */
+        app->rx_spool_writer = -1;
+        app->rx_spool_batch_count = 0;
+        app->rx_capture_active = false;
+        app->rx_capture_blocked = true;
+        app->rx_spool_lost++;
+        return false;
+    }
+    s->bytes += (uint32_t)bytes;
+    app->rx_spool_batch_count = 0;
+    return true;
+}
+
+static void rx_spool_finish(AppState* app) {
+    if(app->rx_spool_writer < 0) return;
+    int8_t idx = app->rx_spool_writer;
+    if(!rx_spool_flush(app)) return;
+    RxSpool* s = &app->rx_spool[(uint8_t)idx];
+    storage_file_close(s->file);
+    s->state = RxSpoolReady;
+    app->rx_spool_writer = -1;
+    app->rx_spool_bursts++;
+    FURI_LOG_I(TAG, "RX spool burst #%lu ready slot=%c edges=%lu bytes=%lu",
+               (unsigned long)app->rx_spool_bursts, (char)('A' + idx),
+               (unsigned long)(s->bytes / sizeof(RxEdge)), (unsigned long)s->bytes);
+    if(app->rx_gate_sample_count) {
+        char sample[96];
+        size_t used = 0;
+        for(uint8_t i = 0; i < app->rx_gate_sample_count; i++) {
+            int written = snprintf(sample + used, sizeof(sample) - used,
+                                   "%s%u:%u", i ? "," : "",
+                                   app->rx_gate_sample_level[i],
+                                   app->rx_gate_sample_duration[i]);
+            if(written < 0 || (size_t)written >= sizeof(sample) - used) break;
+            used += (size_t)written;
+        }
+        FURI_LOG_I(TAG, "RX waveform slot=%c gate-onset=%s (callback-level:duration-us)",
+                   (char)('A' + idx), sample);
+    }
+}
+
+static void rx_spool_append(AppState* app, const RxEdge* edge) {
+    if(app->rx_spool_writer < 0) return;
+    RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_writer];
+    uint32_t projected = s->bytes +
+                         ((uint32_t)app->rx_spool_batch_count + 1u) * sizeof(RxEdge);
+    if(projected > RX_SPOOL_MAX_BYTES) {
+        FURI_LOG_E(TAG, "RX spool burst exceeded %u bytes; preserving partial and dropping burst",
+                   RX_SPOOL_MAX_BYTES);
+        (void)rx_spool_flush(app);
+        if(app->rx_spool_writer >= 0) {
+            storage_file_close(s->file);
+            s->state = RxSpoolFailed; /* partial capture is not replayed as a complete burst */
+            app->rx_spool_writer = -1;
+        }
+        app->rx_capture_active = false;
+        app->rx_capture_blocked = true;
+        app->rx_spool_lost++;
+        return;
+    }
+    app->rx_spool_batch[app->rx_spool_batch_count++] = *edge;
+    if(app->rx_spool_batch_count == RX_SPOOL_BATCH) (void)rx_spool_flush(app);
+}
+
+static void rx_spool_start_playback(AppState* app) {
+    if(app->rx_spool_player >= 0) return;
+    int8_t best = -1;
+    for(uint8_t i = 0; i < RX_SPOOL_SLOTS; i++) {
+        RxSpool* s = &app->rx_spool[i];
+        if(s->state == RxSpoolReady &&
+           (best < 0 || (int32_t)(s->order - app->rx_spool[(uint8_t)best].order) < 0))
+            best = (int8_t)i;
+    }
+    if(best < 0) return;
+    RxSpool* s = &app->rx_spool[(uint8_t)best];
+    if(!storage_file_open(s->file, s->path, FSAM_READ, FSOM_OPEN_EXISTING)) {
+        FURI_LOG_E(TAG, "RX spool playback open failed slot=%c; file retained",
+                   (char)('A' + best));
+        s->state = RxSpoolFailed; /* preserve on disk; don't spin retrying an I/O error */
+        app->rx_spool_lost++;
+        return;
+    }
+    s->play_pos = 0;
+    app->rx_spool_play_count = 0;
+    app->rx_spool_play_index = 0;
+    s->state = RxSpoolPlaying;
+    app->rx_spool_player = best;
+    FURI_LOG_I(TAG, "RX spool playback start slot=%c edges=%lu",
+               (char)('A' + best), (unsigned long)(s->bytes / sizeof(RxEdge)));
+}
+
+static void rx_spool_play_pump(AppState* app) {
+    rx_spool_start_playback(app);
+    if(app->rx_spool_player < 0) return;
+    RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_player];
+    uint32_t remain = (s->bytes - s->play_pos) / sizeof(RxEdge);
+    if(app->rx_spool_play_index == app->rx_spool_play_count && remain == 0) {
+        int8_t idx = app->rx_spool_player;
+        storage_file_close(s->file);
+        if(storage_common_remove(app->storage, s->path) == FSE_OK) {
+            uint8_t pending = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_pending, 1);
+            uint8_t decoder = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
+            FURI_LOG_I(TAG,
+                       "RX spool playback complete slot=%c; SD file deleted, decoder pending=0x%02X state=%u",
+                       (char)('A' + idx), pending, decoder);
+            app->rx_spool_replayed++;
+            s->state = RxSpoolFree;
+        } else {
+            FURI_LOG_E(TAG, "RX spool delete failed slot=%c; file retained",
+                       (char)('A' + idx));
+            s->state = RxSpoolFailed;
+            app->rx_spool_lost++;
+        }
+        app->rx_spool_player = -1;
+        app->rx_spool_play_count = 0;
+        app->rx_spool_play_index = 0;
+        return;
+    }
+    if(app->rx_spool_play_index == app->rx_spool_play_count) {
+        uint32_t count = remain < RX_SPOOL_BATCH ? remain : RX_SPOOL_BATCH;
+        size_t nbytes = (size_t)count * sizeof(RxEdge);
+        bool first_chunk = s->play_pos == 0;
+        size_t got = storage_file_read(s->file, app->rx_spool_play_batch, nbytes);
+        if(got != nbytes) {
+            int8_t idx = app->rx_spool_player;
+            FURI_LOG_E(TAG, "RX spool playback read failed slot=%c at=%lu; file retained",
+                       (char)('A' + idx), (unsigned long)s->play_pos);
+            storage_file_close(s->file);
+            s->state = RxSpoolFailed;
+            app->rx_spool_player = -1;
+            app->rx_spool_play_count = 0;
+            app->rx_spool_play_index = 0;
+            app->rx_spool_lost++;
+            return;
+        }
+        s->play_pos += (uint32_t)got;
+        app->rx_spool_play_count = (uint16_t)count;
+        app->rx_spool_play_index = 0;
+        if(first_chunk) {
+            /* HAL callback levels describe the pulse that just ended. Seed the
+             * emulated DATA pin at that pulse's level before replaying its
+             * duration and the following transition. */
+            rx_prime(app, app->rx_spool_play_batch[0].level != 0);
+        }
+    }
+    while(app->rx_spool_play_index < app->rx_spool_play_count) {
+        RxEdge* edge = &app->rx_spool_play_batch[app->rx_spool_play_index++];
+        /* Let the emulated main loop observe each completed frame before feeding
+         * later frames, as the physical radio ISR would. */
+        if(rx_deliver_edge(app, edge)) break;
+    }
+}
+
+static bool rx_deliver_edge(AppState* app, const RxEdge* edge) {
+    /* FuriHalSubGhzCaptureCallback reports true on a falling edge after the
+     * high pulse, and false on a rising edge after the low pulse. The firmware
+     * ISR needs the post-edge DATA level, so feed the opposite level. */
+    bool done = rx_feed_edge(app, edge->level == 0, edge->duration);
+    if(!done) return false;
+
+    app->rx_frames++;
+    uint8_t id = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
+    char line[64];
+    int off = 0;
+    for(int i = 0; i < 12; i++) {
+        uint8_t b = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_result + (uint32_t)i, 1);
+        int w = snprintf(line + off, sizeof(line) - (size_t)off, "%02X", b);
+        if(w < 0 || (size_t)(off + w) >= sizeof(line)) break;
+        off += w;
+    }
+    FURI_LOG_I(TAG, "RX frame #%lu decoded id=%u frame=%s",
+               (unsigned long)app->rx_frames, id, line);
+    rx_prime(app, app->rx_prev_level);
+    return true;
 }
 
 static void rx_bridge_start(AppState* app) {
@@ -2438,13 +2973,34 @@ static void rx_bridge_start(AppState* app) {
         app->tx_active = false;
     }
     furi_hal_subghz_idle();
-    furi_message_queue_reset(app->rx_queue);
-    rx_prime(app, 1 /* default decoder mode */, false);
+    /* Keep already captured edges across quick firmware READY->RX transitions.
+     * Resetting the ring here used to silently erase a full backlog. */
+    rx_prime(app, false);
+    app->rx_preroll_count = 0;
+    app->rx_preroll_head = 0;
+    app->rx_capture_active = false;
+    app->rx_capture_blocked = false;
+    app->rx_capture_post_remaining_us = 0;
+    app->rx_spool_batch_count = 0;
+    app->rx_preroll_head = 0;
+    app->rx_preroll_count = 0;
+    app->rx_preroll_frozen = 0;
+    app->rx_postroll_isr_us = 0;
+    app->rx_gate_below_tick = 0;
+    app->rx_rssi_sample_tick = 0;
+    app->rx_rssi_initialized = false;
+    app->rx_noise_floor_dbm = -105.0f;
+    app->rx_gate_open_dbm = RX_RSSI_MIN_OPEN_DBM;
+    __atomic_store_n(&app->rx_gate_open_isr, 0u, __ATOMIC_RELEASE);
+    uint8_t decoder_mode = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_mode, 1);
+    uint32_t queued = __atomic_load_n(&app->rx_head, __ATOMIC_ACQUIRE) -
+                      __atomic_load_n(&app->rx_tail, __ATOMIC_ACQUIRE);
     furi_hal_subghz_start_async_rx(radio_rx_callback, app);
     app->rx_running = true;
-    FURI_LOG_I(TAG, "RX bridge ON (injects into ISR 0x%06lX, DATA pin B%u.%u)",
+    FURI_LOG_I(TAG,
+               "RX bridge ON (ISR 0x%06lX, DATA B%u.%u, decoder=%u queued=%lu, RSSI gate)",
                (unsigned long)app->prof->demod_isr, app->prof->data_port,
-               app->prof->data_pin);
+               app->prof->data_pin, decoder_mode, (unsigned long)queued);
 }
 
 static void rx_bridge_stop(AppState* app) {
@@ -2453,56 +3009,72 @@ static void rx_bridge_stop(AppState* app) {
     furi_hal_subghz_idle();
     app->rx_running = false;
     app->rx_primed = false;
+    __atomic_store_n(&app->rx_gate_open_isr, 0u, __ATOMIC_RELEASE);
+    app->rx_capture_active = false;
+    app->rx_capture_post_remaining_us = 0;
+    rx_spool_finish(app);
+    if(app->rx_spool_player >= 0) {
+        RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_player];
+        storage_file_close(s->file);
+        s->play_pos = 0;
+        app->rx_spool_play_count = 0;
+        app->rx_spool_play_index = 0;
+        s->state = RxSpoolReady; /* restart from edge zero; never delete a partial replay */
+        app->rx_spool_player = -1;
+    }
     FURI_LOG_I(TAG, "RX bridge OFF (%lu edges injected, %lu frames)",
-               (unsigned long)app->rx_events, (unsigned long)app->rx_frames);
+               (unsigned long)app->rx_injected, (unsigned long)app->rx_frames);
 }
 
-/* Drains the RX queue and injects each edge into the firmware demodulator. */
+/* Drain capture into bounded SD bursts, then replay each burst to the firmware ISR. */
 static void rx_bridge_pump(AppState* app) {
     if(!app->rx_running) return;
-    RfEdge e;
-    int drained = 0;
-    while(furi_message_queue_get(app->rx_queue, &e, 0) == FuriStatusOk) {
-        bool done = rx_feed_edge(app, e.level, e.duration);
-        drained++;
-        if(done) {
-            app->rx_frames++;
-            uint8_t id = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
-            char line[64];
-            int off = 0;
-            for(int i = 0; i < 12; i++) {
-                uint8_t b = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_result + (uint32_t)i, 1);
-                int w = snprintf(line + off, sizeof(line) - (size_t)off, "%02X", b);
-                if(w < 0 || (size_t)(off + w) >= sizeof(line)) break;
-                off += w;
+    RxEdge e;
+    uint32_t processed = 0;
+    while(processed < RX_PUMP_MAX_EDGES && radio_rx_dequeue(app, &e)) {
+        processed++;
+        if(e.gate_open) {
+            if(!app->rx_capture_active && !app->rx_capture_blocked) {
+                if(rx_spool_alloc(app) >= 0) {
+                    app->rx_capture_active = true;
+                    /* Keep the complete pulse history immediately before RSSI rose. */
+                    uint16_t oldest = (uint16_t)((app->rx_preroll_head + RX_PREROLL_LEN -
+                                                  app->rx_preroll_count) % RX_PREROLL_LEN);
+                    for(uint16_t i = 0; i < app->rx_preroll_count; i++)
+                        rx_spool_append(app, &app->rx_preroll[(oldest + i) % RX_PREROLL_LEN]);
+                    app->rx_preroll_count = 0;
+                } else {
+                    app->rx_capture_blocked = true;
+                }
             }
-            FURI_LOG_I(TAG, "RX frame #%lu decoded id=%u frame=%s",
-                       (unsigned long)app->rx_frames, id, line);
-            /* re-prime for the next frame */
-            rx_prime(app, 1, app->rx_prev_level);
+            app->rx_capture_post_remaining_us = 0;
+            if(app->rx_capture_active) {
+                if(app->rx_gate_sample_count < 8u) {
+                    uint8_t sample = app->rx_gate_sample_count++;
+                    app->rx_gate_sample_duration[sample] = e.duration;
+                    app->rx_gate_sample_level[sample] = e.level;
+                }
+                rx_spool_append(app, &e);
+            }
+        } else if(app->rx_capture_active) {
+            rx_spool_append(app, &e);
+            if(app->rx_capture_active) {
+                if(app->rx_capture_post_remaining_us == 0)
+                    app->rx_capture_post_remaining_us = RX_POSTROLL_MS * 1000u;
+                if(e.duration >= app->rx_capture_post_remaining_us) {
+                    app->rx_capture_active = false;
+                    app->rx_capture_post_remaining_us = 0;
+                    rx_spool_finish(app);
+                } else {
+                    app->rx_capture_post_remaining_us -= e.duration;
+                }
+            }
+        } else {
+            app->rx_capture_blocked = false;
         }
-        if(drained >= 48) break; /* do not hog the frame */
     }
-    if(drained) {
-        /* FLUIDITY: this log used to fire EVERY frame the queue had edges (many
-         * times/second while a remote is transmitting -> "RX injected 48 edges"
-         * spam). FURI_LOG has a non-trivial per-call cost (string format + mutex
-         * on the log bus) that competes with the interpreter. Throttle it to at
-         * most ~once/second so the diagnostic is kept but the per-frame overhead
-         * is gone. The useful counters (rx_events/rx_frames) are still reported
-         * precisely by the RX heartbeat; nothing functional depends on this log. */
-        static uint32_t s_rxinj_tick = 0;
-        static uint32_t s_rxinj_edges = 0;
-        s_rxinj_edges += (uint32_t)drained;
-        uint32_t t = furi_get_tick();
-        if(s_rxinj_tick == 0) s_rxinj_tick = t;
-        if((uint32_t)(t - s_rxinj_tick) >= 1000) {
-            FURI_LOG_D(TAG, "RX injected %lu edges/s (total %lu)",
-                       (unsigned long)s_rxinj_edges, (unsigned long)app->rx_events);
-            s_rxinj_edges = 0;
-            s_rxinj_tick = t;
-        }
-    }
+    rx_spool_play_pump(app);
+    if(processed) app->buzz_request = false;
 }
 
 /* Toggles the RF bridge: OFF -> TX -> RX -> OFF. Logged (like PandoraPIC). */
@@ -2817,6 +3389,16 @@ static MenuFlow run_menu(AppState* app, Gui* gui) {
     app->view_dispatcher = view_dispatcher_alloc();
     app->submenu = submenu_alloc();
     app->about_widget = widget_alloc();
+    if(!app->view_dispatcher || !app->submenu || !app->about_widget) {
+        FURI_LOG_E(TAG, "menu allocation failed");
+        if(app->submenu) submenu_free(app->submenu);
+        if(app->about_widget) widget_free(app->about_widget);
+        if(app->view_dispatcher) view_dispatcher_free(app->view_dispatcher);
+        app->submenu = NULL;
+        app->about_widget = NULL;
+        app->view_dispatcher = NULL;
+        return FlowExit;
+    }
 
     view_dispatcher_set_event_callback_context(app->view_dispatcher, app);
     view_dispatcher_set_navigation_event_callback(app->view_dispatcher, menu_back_callback);
@@ -2995,11 +3577,13 @@ static void run_emulator(AppState* app, Gui* gui) {
     Canvas* canvas = NULL;
     bool fb_cb_added = false;
 
-    app->rx_queue = furi_message_queue_alloc(RX_QUEUE_LEN, sizeof(RfEdge));
-    if(!app->rx_queue) {
-        FURI_LOG_E(TAG, "rx_queue alloc failed");
+    app->rx_ring = (RxEdge*)safe_malloc(RX_RING_LEN * sizeof(RxEdge));
+    if(!app->rx_ring) {
+        FURI_LOG_E(TAG, "rx ring alloc failed");
         return;
     }
+    app->rx_spool_writer = -1;
+    app->rx_spool_player = -1;
 
     app->gui = gui;
     gui_add_framebuffer_callback(gui, framebuffer_commit_callback, app);
@@ -3016,6 +3600,8 @@ static void run_emulator(AppState* app, Gui* gui) {
 
     uint32_t epoch = furi_get_tick();
     uint64_t next_us = 0;
+    uint32_t rendered_oled_frames = UINT32_MAX;
+    uint32_t last_screen_commit_tick = furi_get_tick();
 
     /* --- PHYSICAL KEY MAPPING (6 Flipper keys = 6 keyfob buttons) ---
      *   Flipper UP    -> Button 1 = UP   pin (On/menu/cell+).  Hold >1s = EXIT.
@@ -3066,6 +3652,7 @@ static void run_emulator(AppState* app, Gui* gui) {
                         /* brief status overlay (RF mode / counters) as feedback;
                          * the normal render resumes on the next frame. */
                         overlay_draw(app);
+                        rendered_oled_frames = UINT32_MAX; /* restore keyfob image next slice */
                         furi_delay_ms(600);
                         key_consumed[fk] = true;
                     }
@@ -3100,13 +3687,17 @@ static void run_emulator(AppState* app, Gui* gui) {
 
         if(app->exit_requested) break;
 
+        /* Poll RSSI outside the GPIO capture IRQ; the edge callback only records
+         * the current gate bit and stays constant-time. */
+        rx_rssi_update(app);
+
         /* run a slice of the real firmware (captures TX via mmio_write).
          * EMU_INSN_PER_FRAME caps how much firmware runs per UI frame. The
          * firmware has an inactivity timeout (~280k insn) that returns a
          * sub-mode to the main carousel -- a REAL feature. Running too fast makes
          * it fire instantly; this value keeps it at a human scale. Tune on real
          * hardware if the pacing feels off (lower = slower fw / longer timeout). */
-        run_burst(app, EMU_INSN_PER_FRAME);
+        run_burst(app, app->rx_running ? EMU_INSN_PER_RX_FRAME : EMU_INSN_PER_FRAME);
 
         /* DIAG: heartbeat every ~2s so we can confirm the loop keeps running and
          * measure the REAL emulation rate on hardware (insn/s = ninsn delta / dt).
@@ -3114,40 +3705,71 @@ static void run_emulator(AppState* app, Gui* gui) {
         {
             static uint32_t s_hb_tick = 0;
             static uint64_t s_hb_ninsn = 0;
+            static uint32_t s_hb_flash_misses = 0;
             uint32_t t = furi_get_tick();
-            if(s_hb_tick == 0) s_hb_tick = t;
-            if((uint32_t)(t - s_hb_tick) >= 2000) {
-                uint64_t di = app->ninsn - s_hb_ninsn;
-                uint32_t dt = t - s_hb_tick;
-                FURI_LOG_D(TAG, "hb: ninsn=%llu rate=%lu k-insn/s unlocked=%d",
-                           (unsigned long long)app->ninsn,
-                           (unsigned long)(dt ? (di / dt) : 0), /* insn/ms == k-insn/s */
-                           app->unlocked);
+            if(s_hb_tick == 0) {
                 s_hb_tick = t;
                 s_hb_ninsn = app->ninsn;
+                s_hb_flash_misses = app->fc.miss_count;
+            }
+            if((uint32_t)(t - s_hb_tick) >= 2000) {
+                uint64_t di = app->ninsn - s_hb_ninsn;
+                uint32_t flash_misses = app->fc.miss_count;
+                uint32_t dt = t - s_hb_tick;
+                /* Keep emulator performance chatter out of RX-focused logs. */
+                if(!app->rx_running) {
+                    FURI_LOG_D(
+                        TAG,
+                        "hb: ninsn=%llu rate=%lu k-insn/s unlocked=%d flash_misses=+%lu",
+                        (unsigned long long)app->ninsn,
+                        (unsigned long)(dt ? (di / dt) : 0), /* insn/ms == k-insn/s */
+                        app->unlocked,
+                        (unsigned long)(flash_misses - s_hb_flash_misses));
+                }
+                s_hb_tick = t;
+                s_hb_ninsn = app->ninsn;
+                s_hb_flash_misses = flash_misses;
             }
         }
 
-        /* DIAG: RX heartbeat every ~1.5s while the receiver is running. Reports
-         * how many RAW edges the CC1101 pulled off the air (rx_events delta) and
-         * how many frames the firmware demodulator decoded (rx_frames delta).
-         * This lets the user tell, on hardware, whether the radio is hearing a
-         * real remote at all (edges > 0) even if the firmware rejects the
-         * protocol (frames == 0). */
+        /* RX-only diagnostic summary: raw activity, loss, RSSI gate, spool and
+         * firmware decode counts. Keep it slow enough for readable CLI captures. */
         if(app->rx_running) {
             static uint32_t s_rxhb_tick = 0;
             uint32_t t = furi_get_tick();
             if(s_rxhb_tick == 0) s_rxhb_tick = t;
-            if((uint32_t)(t - s_rxhb_tick) >= 1500) {
-                uint32_t de = app->rx_events - app->rx_events_hb;
+            if((uint32_t)(t - s_rxhb_tick) >= RX_HEARTBEAT_MS) {
+                uint32_t events = __atomic_load_n(&app->rx_events, __ATOMIC_RELAXED);
+                uint32_t dropped = __atomic_load_n(&app->rx_dropped, __ATOMIC_RELAXED);
+                uint32_t queued =
+                    __atomic_load_n(&app->rx_head, __ATOMIC_ACQUIRE) -
+                    __atomic_load_n(&app->rx_tail, __ATOMIC_ACQUIRE);
+                uint32_t de = events - app->rx_events_hb;
                 uint32_t df = app->rx_frames - app->rx_frames_hb;
-                FURI_LOG_I(TAG,
-                           "RX hb: @%lu Hz air_edges=+%lu (tot %lu) decoded=+%lu (tot %lu)",
-                           (unsigned long)app->frequency, (unsigned long)de,
-                           (unsigned long)app->rx_events, (unsigned long)df,
-                           (unsigned long)app->rx_frames);
-                app->rx_events_hb = app->rx_events;
+                uint32_t dd = dropped - app->rx_dropped_hb;
+                uint32_t gate_opens = app->rx_gate_open_count;
+                uint32_t gate_closes = app->rx_gate_close_count;
+                FURI_LOG_I(
+                    TAG,
+                    "RX: @%luHz air=+%lu in=%lu q=%lu drop=+%lu gate=%u RSSI=%.1f/%.1f/%.1f "
+                    "gate_evt=+%lu/-%lu spool=%lu replay=%lu lost=%lu frame=+%lu/%lu",
+                    (unsigned long)app->frequency, (unsigned long)de,
+                    (unsigned long)app->rx_injected, (unsigned long)queued,
+                    (unsigned long)dd,
+                    (unsigned)__atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_RELAXED),
+                    (double)app->rx_rssi_dbm, (double)app->rx_noise_floor_dbm,
+                    (double)app->rx_gate_open_dbm,
+                    (unsigned long)(gate_opens - app->rx_gate_open_hb),
+                    (unsigned long)(gate_closes - app->rx_gate_close_hb),
+                    (unsigned long)app->rx_spool_bursts,
+                    (unsigned long)app->rx_spool_replayed,
+                    (unsigned long)app->rx_spool_lost,
+                    (unsigned long)df, (unsigned long)app->rx_frames);
+                app->rx_events_hb = events;
+                app->rx_dropped_hb = dropped;
                 app->rx_frames_hb = app->rx_frames;
+                app->rx_gate_open_hb = gate_opens;
+                app->rx_gate_close_hb = gate_closes;
                 s_rxhb_tick = t;
             }
         }
@@ -3163,9 +3785,20 @@ static void run_emulator(AppState* app, Gui* gui) {
          * active and releases it as soon as the firmware's buzzer burst ceases. */
         beep_pump(app);
 
-        /* redraw the screen from the firmware framebuffer */
-        render_oled(app);
-        if(!app->menu_active) canvas_commit(canvas);
+        /* New firmware frames are shown immediately. Keep a periodic repaint as
+         * well: some firmware leaves its framebuffer unchanged for long periods,
+         * and the Flipper's direct-draw canvas can otherwise appear black until
+         * the next keypress causes a commit. */
+        uint32_t screen_tick = furi_get_tick();
+        bool oled_changed = app->oled_frames != rendered_oled_frames;
+        bool refresh_due =
+            (uint32_t)(screen_tick - last_screen_commit_tick) >= SCREEN_REFRESH_FALLBACK_MS;
+        if(oled_changed || refresh_due) {
+            render_oled(app);
+            if(!app->menu_active) canvas_commit(canvas);
+            rendered_oled_frames = app->oled_frames;
+            last_screen_commit_tick = screen_tick;
+        }
 
         /* pacing + yield */
         next_us += FRAME_US;
@@ -3186,22 +3819,31 @@ static void run_emulator(AppState* app, Gui* gui) {
 teardown:
     /* DIAG: log each teardown step so a crash (furi_check failed) that happens on
      * exit / USB disconnect can be localised to the exact resource being freed. */
-    FURI_LOG_I(TAG, "teardown: begin (exit_req=%d)", app->exit_requested);
+    FURI_LOG_D(TAG, "teardown: begin (exit_req=%d)", app->exit_requested);
     outputs_teardown(app); /* stop/release the speaker and clear the LED */
-    FURI_LOG_I(TAG, "teardown: outputs (speaker/LED) released");
+    FURI_LOG_D(TAG, "teardown: outputs (speaker/LED) released");
     radio_deinit(app);
-    FURI_LOG_I(TAG, "teardown: radio_deinit done");
-    if(fb_cb_added) gui_remove_framebuffer_callback(gui, framebuffer_commit_callback, app);
-    FURI_LOG_I(TAG, "teardown: fb callback removed");
-    wait_inflight_zero(&s_fb_cb_inflight);
-    FURI_LOG_I(TAG, "teardown: inflight drained");
-    if(canvas) gui_direct_draw_release(gui);
-    FURI_LOG_I(TAG, "teardown: direct_draw released");
-    if(app->rx_queue) {
-        furi_message_queue_free(app->rx_queue);
-        app->rx_queue = NULL;
+    FURI_LOG_D(TAG, "teardown: radio_deinit done");
+    for(uint8_t i = 0; i < RX_SPOOL_SLOTS; i++) {
+        RxSpool* s = &app->rx_spool[i];
+        if(s->file) {
+            if(s->state == RxSpoolWriting || s->state == RxSpoolPlaying)
+                storage_file_close(s->file);
+            storage_file_free(s->file);
+            s->file = NULL;
+        }
     }
-    FURI_LOG_I(TAG, "emulator: exit");
+    if(fb_cb_added) gui_remove_framebuffer_callback(gui, framebuffer_commit_callback, app);
+    FURI_LOG_D(TAG, "teardown: fb callback removed");
+    wait_inflight_zero(&s_fb_cb_inflight);
+    FURI_LOG_D(TAG, "teardown: inflight drained");
+    if(canvas) gui_direct_draw_release(gui);
+    FURI_LOG_D(TAG, "teardown: direct_draw released");
+    if(app->rx_ring) {
+        free(app->rx_ring);
+        app->rx_ring = NULL;
+    }
+    FURI_LOG_D(TAG, "emulator: exit");
 }
 
 /* ------------------------------------------------------------ main */
@@ -3218,6 +3860,15 @@ int32_t pandora_arm_app(void* p) {
     Gui* gui = (Gui*)furi_record_open(RECORD_GUI);
     app->storage = storage; /* kept so the flash cache can stream pages at runtime */
     app->fw_path = furi_string_alloc_set_str("/ext");
+    if(!storage || !dialogs || !gui || !app->fw_path) {
+        FURI_LOG_E(TAG, "startup allocation/record open failed");
+        if(app->fw_path) furi_string_free(app->fw_path);
+        if(gui) furi_record_close(RECORD_GUI);
+        if(dialogs) furi_record_close(RECORD_DIALOGS);
+        if(storage) furi_record_close(RECORD_STORAGE);
+        free(app);
+        return -1;
+    }
 
     bool launch = false;
 
@@ -3287,11 +3938,13 @@ int32_t pandora_arm_app(void* p) {
             if(!app->ram) {
                 FURI_LOG_E(TAG, "ram alloc failed");
                 DialogMessage* msg = dialog_message_alloc();
-                dialog_message_set_text(
-                    msg, "Out of memory\n(RAM 32K)", 64, 30, AlignCenter, AlignCenter);
-                dialog_message_set_buttons(msg, NULL, "OK", NULL);
-                dialog_message_show(dialogs, msg);
-                dialog_message_free(msg);
+                if(msg) {
+                    dialog_message_set_text(
+                        msg, "Out of memory\n(RAM 32K)", 64, 30, AlignCenter, AlignCenter);
+                    dialog_message_set_buttons(msg, NULL, "OK", NULL);
+                    dialog_message_show(dialogs, msg);
+                    dialog_message_free(msg);
+                }
                 break;
             }
             memset(app->ram, 0, PA_RAM_SIZE);
@@ -3314,10 +3967,12 @@ int32_t pandora_arm_app(void* p) {
                     snprintf(tbuf, sizeof(tbuf), "Load error");
                 FURI_LOG_E(TAG, "load failed: %s", tbuf);
                 DialogMessage* msg = dialog_message_alloc();
-                dialog_message_set_text(msg, tbuf, 64, 30, AlignCenter, AlignCenter);
-                dialog_message_set_buttons(msg, NULL, "OK", NULL);
-                dialog_message_show(dialogs, msg);
-                dialog_message_free(msg);
+                if(msg) {
+                    dialog_message_set_text(msg, tbuf, 64, 30, AlignCenter, AlignCenter);
+                    dialog_message_set_buttons(msg, NULL, "OK", NULL);
+                    dialog_message_show(dialogs, msg);
+                    dialog_message_free(msg);
+                }
                 break;
             }
 
