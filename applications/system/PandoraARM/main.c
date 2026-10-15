@@ -204,6 +204,11 @@ typedef struct {
      * PB0; on TXON read the PB3 waveform and transmit it. */
     bool rf_sw_demod; /* true: SW demodulation via ISR (BOTH firmwares) */
     uint32_t demod_isr; /* demod ISR: pandora=0x09554, pmax=0x0945C */
+    /* RX replay may feed the measured pulse width straight to the firmware's
+     * decoder dispatcher, skipping the expensive GPIO majority-filter pass. */
+    uint32_t rx_decoder_dispatch; /* pandora=0x096D6, pmax=0x095F0 */
+    uint32_t rx_state_base;
+    uint32_t rx_width_cur, rx_width_prev, rx_width_prev2;
     uint8_t data_port; /* RX-data pin port: PB0 -> port1 */
     uint8_t data_pin; /* RX-data pin: PB0 -> pin0 */
     uint8_t tx_data_port; /* TX-data pin port: PB3 -> port1 */
@@ -227,7 +232,7 @@ typedef struct {
     uint32_t rx_valid; /* optional decoded-result validity byte */
     uint32_t rx_brand; /* optional decoded-result brand byte */
     uint32_t rx_index; /* optional decoded-result display/menu index byte */
-    uint8_t rx_clear_len; /* transient RAM prefix to clear when arming RX */
+    uint8_t rx_filter_taps; /* Pandora RX history at rx_struct+0x10; 0 if unknown */
     bool rx_reset_state; /* rx_state is transient and can be reset on arm */
     bool rx_metadata_after_handler; /* metadata is populated by foreground, not ISR */
     uint8_t rx_scratch_sp_valid; /* 1 if the scratch SP should be used to call the ISR */
@@ -261,6 +266,11 @@ static const ArmProfile PROFILE_PANDORA = {
      * RX-data=PB0, TX-data=PB3, CS=PE9, antenna PE14(RX)/PE15(TX). */
     .rf_sw_demod = true,
     .demod_isr = 0x09554u,
+    .rx_decoder_dispatch = 0x096D6u,
+    .rx_state_base = 0x200005C0u,
+    .rx_width_cur = 0x200005D8u,
+    .rx_width_prev = 0x200005DCu,
+    .rx_width_prev2 = 0x200005E0u,
     .data_port = 1, /* PB0 = RX-data */
     .data_pin = 0,
     .tx_data_port = 1, .tx_data_pin = 3, /* PB3 = TX-data (OOK bit-bang) */
@@ -279,7 +289,7 @@ static const ArmProfile PROFILE_PANDORA = {
     .rx_brand = 0x20001720u, /* result struct +0x0C */
     .rx_valid = 0x20001721u, /* result struct +0x0D */
     .rx_index = 0x20001722u, /* result struct +0x0E */
-    .rx_clear_len = 0x40,
+    .rx_filter_taps = 5,
     .rx_reset_state = true,
     .rx_metadata_after_handler = true,
     .rx_scratch_sp_valid = 1,
@@ -313,6 +323,11 @@ static const ArmProfile PROFILE_PANDORAMAX = {
      * PE14/PE15). Its RX mode/state layout differs from pandora. */
     .rf_sw_demod = true,
     .demod_isr = 0x0945Cu,
+    .rx_decoder_dispatch = 0x095F0u,
+    .rx_state_base = 0x2000003Cu,
+    .rx_width_cur = 0x20000054u,
+    .rx_width_prev = 0x20000058u,
+    .rx_width_prev2 = 0x2000005Cu,
     .data_port = 1, /* PB0 = RX-data */
     .data_pin = 0,
     .tx_data_port = 1, .tx_data_pin = 3, /* PB3 = TX-data (OOK bit-bang) */
@@ -334,7 +349,7 @@ static const ArmProfile PROFILE_PANDORAMAX = {
     .rx_valid = 0x20000BBBu,
     .rx_brand = 0x20000BBCu,
     .rx_index = 0,
-    .rx_clear_len = 0,
+    .rx_filter_taps = 0,
     .rx_reset_state = false,
     .rx_scratch_sp_valid = 0,
 };
@@ -470,18 +485,22 @@ static const uint8_t FK_TO_KBIT[FK_COUNT] = {
 /* RX: the CC1101 capture ISR writes edges to a single-producer/single-consumer
  * ring; the emulator thread feeds them to the firmware demodulator. */
 #define RX_RING_MAX_LEN 2048u
-#define RX_PUMP_MAX_EDGES 512u
-#define RX_ISR_SAMPLES_PER_EDGE 6u /* settle the firmware's 5-tap majority filter */
+/* The replayed duration is still passed unchanged to the emulated TIMER1/ISR.
+ * This is only a host-side scheduling batch: a decoded frame breaks the batch
+ * immediately so the firmware foreground handler gets to consume it. Eight
+ * edges per UI iteration made an SD spool take minutes to replay. */
+#define RX_PLAY_MAX_EDGES_PER_PUMP 256u
+#define RX_ISR_SAMPLES_PER_EDGE 6u /* conservative fallback when taps are unknown */
 #define RX_PREROLL_LEN 256u /* retain roughly 60-120 ms before RSSI trigger */
 #define RX_SPOOL_SLOTS 2u
-#define RX_SPOOL_BATCH 256u
+#define RX_SPOOL_BATCH 512u
 #define RX_SPOOL_MAX_BYTES (256u * 1024u)
 #define RX_POSTROLL_MS 100u
 #define RX_RSSI_POLL_MS 20u
 #define RX_RSSI_MIN_OPEN_DBM (-95.0f)
 #define RX_RSSI_NOISE_MARGIN_DB 6.0f
 #define RX_RSSI_HYSTERESIS_DB 3.0f
-#define RX_RSSI_HANG_MS 100u
+#define RX_RSSI_HANG_MS 300u
 #define RX_HEARTBEAT_MS 5000u
 
 /* ninsn->us conversion for the bit-bang TX. The keyfob is not real-time under
@@ -564,6 +583,7 @@ typedef struct {
     uint32_t play_pos;
     uint32_t order;
     uint32_t write_errors;
+    uint32_t drop_start;
     char path[48];
 } RxSpool;
 
@@ -742,7 +762,9 @@ typedef struct {
     uint32_t tx_edges_dropped; /* waveform intervals lost to a full ring */
 
     /* RX bridge: single-producer (CC1101 capture ISR), single-consumer ring. */
-    RxEdge* rx_ring;
+    uint8_t* rx_ring_storage;
+    uint16_t* rx_ring_duration;
+    uint8_t* rx_ring_flags; /* 2 packed bits per edge: level, RSSI gate */
     uint16_t rx_ring_capacity; /* may degrade under heap pressure; spool retains bursts */
     volatile uint32_t rx_head; /* ISR producer sequence */
     volatile uint32_t rx_tail; /* emulator consumer sequence */
@@ -755,10 +777,18 @@ typedef struct {
     uint32_t rx_events; /* raw edges delivered by the CC1101 callback */
     uint32_t rx_injected; /* edges actually delivered to the emulated demod ISR */
     uint32_t rx_dropped; /* edges rejected because the RX queue was full */
+    uint32_t rx_gate_drop_snapshot; /* rx_dropped when the RSSI gate opened */
     uint32_t rx_frames; /* frames decoded by the firmware */
     bool rx_last_frame_valid; /* suppress repeated identical frame log lines */
     uint8_t rx_last_frame_id;
     uint8_t rx_last_frame[12];
+    /* Short instruction-hook window after a decoded frame. Used only to map
+     * the firmware's real RX handler -> draw_char path; disabled otherwise. */
+    uint32_t rx_addr_trace_left;
+    char rx_drawn_text[48];
+    uint8_t rx_drawn_text_len;
+    uint8_t rx_addr_trace_handler_seen;
+    bool rx_addr_trace_done;
     RxEdge rx_preroll[RX_PREROLL_LEN]; /* recent raw edges before RSSI gate opens */
     volatile uint16_t rx_preroll_head;
     volatile uint16_t rx_preroll_count;
@@ -769,8 +799,9 @@ typedef struct {
     uint32_t rx_gate_open_count;
     uint32_t rx_gate_close_count;
     RxSpool rx_spool[RX_SPOOL_SLOTS];
-    RxEdge rx_spool_batch[RX_SPOOL_BATCH];
-    RxEdge rx_spool_play_batch[RX_SPOOL_BATCH];
+    /* Writer and player share this 2 KiB buffer. Before a new capture writes,
+     * playback is rewound to its first undelivered edge and paused. */
+    RxEdge rx_spool_buffer[RX_SPOOL_BATCH];
     uint16_t rx_spool_batch_count;
     uint16_t rx_spool_play_count;
     uint16_t rx_spool_play_index;
@@ -1039,10 +1070,46 @@ static void oled_commit(AppState* app) {
         uint8_t screen = p->ui_screen ?
                              (uint8_t)thumb_read_mem(app->cpu, p->ui_screen, 1) :
                              0xFFu;
+        uint8_t ui_mode = p->ui_mode ?
+                              (uint8_t)thumb_read_mem(app->cpu, p->ui_mode, 1) :
+                              0xFFu;
+        uint8_t ui_cursor = p->ui_cursor ?
+                                (uint8_t)thumb_read_mem(app->cpu, p->ui_cursor, 1) :
+                                0xFFu;
+        uint16_t gray[4] = {0, 0, 0, 0};
+        int min_x = OLED_VISIBLE_COLS, min_y = OLED_PAGES * 4;
+        int max_x = -1, max_y = -1;
+        for(int page = 0; page < OLED_PAGES; page++) {
+            for(int col = 0; col < OLED_VISIBLE_COLS; col++) {
+                uint8_t b = app->oled_work[page * OLED_COLS + col];
+                for(int k = 0; k < 4; k++) {
+                    uint8_t level = (uint8_t)(((b >> (2 * k)) & 1u) |
+                                              (((b >> (2 * k + 1)) & 1u) << 1));
+                    gray[level]++;
+                    if(level >= 2) {
+                        int y = page * 4 + k;
+                        if(col < min_x) min_x = col;
+                        if(col > max_x) max_x = col;
+                        if(y < min_y) min_y = y;
+                        if(y > max_y) max_y = y;
+                    }
+                }
+            }
+        }
         FURI_LOG_I(TAG,
-                   "RX OLED frame committed #%lu nonzero=%u result=%u/%u/%u screen=%u",
-                   (unsigned long)app->oled_frames, (unsigned)nonzero, valid, brand,
-                   index, screen);
+                   "RX OLED commit #%lu fb=0x%08lX nonzero=%u gray=%u/%u/%u/%u "
+                   "bbox=%d,%d-%d,%d result[c/d/e]=%u/%u/%u ui=%u/%u/%u",
+                   (unsigned long)app->oled_frames, (unsigned long)p->fb_addr,
+                   (unsigned)nonzero,
+                   (unsigned)gray[0], (unsigned)gray[1], (unsigned)gray[2],
+                   (unsigned)gray[3], min_x, min_y, max_x, max_y, brand, valid,
+                   index, screen, ui_mode, ui_cursor);
+        if(app->rx_drawn_text_len) {
+            app->rx_drawn_text[app->rx_drawn_text_len] = '\0';
+            FURI_LOG_I(TAG, "RX draw_char trace: \"%s\" (%u chars)",
+                       app->rx_drawn_text, app->rx_drawn_text_len);
+            app->rx_drawn_text_len = 0;
+        }
     }
 }
 
@@ -1481,6 +1548,29 @@ static void code_hook(void* ctx, uint32_t pc) {
     AppState* app = (AppState*)ctx;
     app->ninsn = emu_insn_now(app);
     app->pc = pc;
+    if(app->rx_addr_trace_left) {
+        app->rx_addr_trace_left--;
+        /* Pandora D605 RE: central RX dispatch @0xD16C, fixed-code handler
+         * for ID 14 @0xD7BA, draw_char @0xA060 (character in r2). */
+        if(pc == 0xD16Cu && !app->rx_addr_trace_handler_seen) {
+            app->rx_addr_trace_handler_seen = 1;
+            FURI_LOG_I(TAG,
+                       "RX addr trace handler @D16C id=%u mode=%u pending=%u",
+                       (unsigned)thumb_read_mem(app->cpu, 0x200005C1u, 1),
+                       (unsigned)thumb_read_mem(app->cpu, 0x200005BCu, 1),
+                       (unsigned)thumb_read_mem(app->cpu, 0x200005C0u, 1));
+        }
+        if(pc == 0xD7BAu) {
+            FURI_LOG_I(TAG, "RX addr trace LandRover fixed handler @D7BA");
+        }
+        if(pc == 0xA060u) {
+            uint32_t ch = thumb_get_reg(app->cpu, 2);
+            if(app->rx_drawn_text_len < sizeof(app->rx_drawn_text) - 1u) {
+                app->rx_drawn_text[app->rx_drawn_text_len++] =
+                    (ch >= 0x20u && ch <= 0x7Eu) ? (char)ch : '?';
+            }
+        }
+    }
     if(!app->unlocked && pc == app->prof->unlock_pc) {
         app->unlocked = 1;
     }
@@ -1496,7 +1586,8 @@ static void run_burst(AppState* app, uint32_t count) {
     ThumbCore* cpu = app->cpu;
     ThumbHook saved_hook = cpu->hook;
     void* saved_hook_ctx = cpu->hook_ctx;
-    bool skip_hook = app->unlocked && !app->nav_active && !app->knock_active;
+    bool skip_hook = app->unlocked && !app->nav_active && !app->knock_active &&
+                     !app->rx_addr_trace_left;
     uint64_t now_insn = emu_insn_now(app);
     bool app_running = cur_vtor(app) >= 0x8000u;
     bool stuck_wfi = app_running && (app->next_pc & ~1u) == (app->wfi_pc_hint & ~1u);
@@ -2599,12 +2690,13 @@ static void radio_rx_enqueue(AppState* app, const RfEdge* e) {
         __atomic_fetch_add(&app->rx_dropped, 1u, __ATOMIC_RELAXED);
         return;
     }
-    RxEdge compact = {
-        .duration = (uint16_t)e->duration,
-        .level = e->level ? 1u : 0u,
-        .gate_open = __atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_RELAXED),
-    };
-    app->rx_ring[head % capacity] = compact;
+    uint16_t slot = (uint16_t)(head % capacity);
+    app->rx_ring_duration[slot] = (uint16_t)e->duration;
+    uint8_t flags = (e->level ? 1u : 0u) |
+                    (__atomic_load_n(&app->rx_gate_open_isr, __ATOMIC_RELAXED) ? 2u : 0u);
+    uint8_t shift = (uint8_t)((slot & 3u) * 2u);
+    uint8_t* packed = &app->rx_ring_flags[slot >> 2u];
+    *packed = (uint8_t)((*packed & (uint8_t)~(3u << shift)) | (flags << shift));
     __atomic_store_n(&app->rx_head, head + 1u, __ATOMIC_RELEASE);
 }
 
@@ -2616,7 +2708,12 @@ static bool radio_rx_dequeue(AppState* app, RxEdge* e) {
     uint32_t tail = __atomic_load_n(&app->rx_tail, __ATOMIC_RELAXED);
     uint32_t head = __atomic_load_n(&app->rx_head, __ATOMIC_ACQUIRE);
     if(tail == head) return false;
-    *e = app->rx_ring[tail % app->rx_ring_capacity];
+    uint16_t slot = (uint16_t)(tail % app->rx_ring_capacity);
+    uint8_t shift = (uint8_t)((slot & 3u) * 2u);
+    uint8_t flags = (uint8_t)((app->rx_ring_flags[slot >> 2u] >> shift) & 3u);
+    e->duration = app->rx_ring_duration[slot];
+    e->level = flags & 1u;
+    e->gate_open = (flags >> 1u) & 1u;
     __atomic_store_n(&app->rx_tail, tail + 1u, __ATOMIC_RELEASE);
     return true;
 }
@@ -2692,6 +2789,8 @@ static void rx_rssi_update(AppState* app) {
         if(app->rx_rssi_dbm >= open_threshold) {
             app->rx_gate_below_tick = 0;
             app->rx_gate_open_count++;
+            app->rx_gate_drop_snapshot =
+                __atomic_load_n(&app->rx_dropped, __ATOMIC_RELAXED);
             __atomic_store_n(&app->rx_gate_open_isr, 1u, __ATOMIC_RELEASE);
             __atomic_store_n(&app->rx_preroll_frozen, 1u, __ATOMIC_RELEASE);
             FURI_LOG_I(TAG,
@@ -2730,9 +2829,12 @@ static void rx_rssi_update(AppState* app) {
 #define ARM_CALL_SENTINEL 0x001FFFF0u
 #define ARM_CALL_SCRATCH_SP 0x20007000u
 
-static void call_subroutine(AppState* app, uint32_t addr, uint32_t max_insn) {
+/* RX's majority filter needs several consecutive calls at each captured
+ * level. Keep every real ISR invocation, but save/restore the emulated main
+ * context and instruction hook once per edge instead of once per sample. */
+static void call_rx_demod_samples(AppState* app, uint8_t repetitions) {
     ThumbCore* cpu = app->cpu;
-    /* save the main loop context */
+    const uint32_t addr = app->prof->demod_isr;
     uint32_t s_pc = app->next_pc;
     uint32_t s_sp = thumb_get_reg(cpu, 13);
     uint32_t s_lr = thumb_get_reg(cpu, 14);
@@ -2741,29 +2843,32 @@ static void call_subroutine(AppState* app, uint32_t addr, uint32_t max_insn) {
     uint8_t s_halted = cpu->halted;
     ThumbHook s_hook = cpu->hook;
     void* s_hook_ctx = cpu->hook_ctx;
-
-    /* RX demodulation calls this once for every RF edge. The normal code hook
-     * updates UI/navigation state per instruction, but neither FSM is active
-     * during an RX ISR. Skipping that callback on this hot path saves a function
-     * call and several branches for every emulated instruction. Keep the
-     * instruction/time counters coherent from the core's cycle counter. */
     bool count_without_hook = app->unlocked && !app->nav_active && !app->knock_active;
     if(count_without_hook) thumb_set_hook(cpu, NULL, NULL);
 
-    thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
-    thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
-    thumb_set_reg(cpu, 15, addr | 1u);
-    cpu->halted = 0;
-
-    for(uint32_t i = 0; i < max_insn; i++) {
-        /* This is the hot path for every received RF pulse. r[15] is public in
-         * ThumbCore; read it directly to avoid an out-of-line accessor per insn. */
-        uint32_t pc = cpu->r[15] & ~1u;
-        if(pc == (ARM_CALL_SENTINEL & ~1u)) break;
-        if(thumb_step(cpu) < 0) break;
+    uint32_t pending_off = app->prof->rx_pending - PA_RAM_BASE;
+    for(uint8_t call = 0; call < repetitions; call++) {
+        thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
+        thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
+        thumb_set_reg(cpu, 15, addr | 1u);
+        cpu->halted = 0;
+        bool returned = false;
+        for(uint32_t i = 0; i < 200000u; i++) {
+            if((cpu->r[15] & ~1u) == (ARM_CALL_SENTINEL & ~1u)) {
+                returned = true;
+                break;
+            }
+            if(thumb_step(cpu) < 0) break;
+        }
+        /* call_subroutine restores these caller-saved registers after every
+         * sample, so keep the same boundary between repeated ISR calls. */
+        thumb_set_reg(cpu, 0, s_r0);
+        thumb_set_reg(cpu, 1, s_r1);
+        cpu->halted = s_halted;
+        if(!returned) break;
+        if(pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF) break;
     }
 
-    /* restore */
     if(count_without_hook) {
         app->ninsn = emu_insn_now(app);
         app->pc = thumb_get_reg(cpu, 15) & ~1u;
@@ -2783,23 +2888,19 @@ static void rx_wr8(AppState* app, uint32_t addr, uint8_t v) {
 }
 
 /* Prepare transient receiver state while preserving firmware-owned UI/decoder
- * state. In pmax, the receiver bytes overlap live screen and brand variables. */
+ * state. Pandora's RX struct shares its first 0x40 bytes with live UI fields
+ * (screen at +0x37, mode at +0x38), so never clear that whole prefix. */
 static void rx_prime(AppState* app, bool init_level) {
     const ArmProfile* p = app->prof;
     uint8_t lvl = init_level ? 1 : 0;
-    uint8_t decoder_mode = (uint8_t)thumb_read_mem(app->cpu, p->rx_mode, 1);
-    if(p->rx_clear_len) {
-        for(uint32_t o = 0; o < p->rx_clear_len; o++)
-            rx_wr8(app, p->rx_struct + o, 0);
-        rx_wr8(app, p->rx_mode, decoder_mode);
-    }
-    /* A profile's clear range excludes any live UI/decoder state it shares. */
+    /* Set only the receiver's live control bytes; do not clear a RAM prefix. */
     rx_wr8(app, p->rx_gate, 1); /* active receiver gate (!=0xFF) */
     rx_wr8(app, p->rx_pending, 0); /* data present (!=0xFF) */
     if(p->rx_reset_state) rx_wr8(app, p->rx_state, 0);
-    if(p->rx_clear_len) {
-        for(uint32_t o = 0x10; o < 0x1C; o++)
-            rx_wr8(app, p->rx_struct + o, lvl);
+    if(p->rx_filter_taps) {
+        /* Clear only the mapped receiver filter/history bytes, including its
+         * filtered-level and edge-marker fields. Do not touch UI state at +0x37. */
+        for(uint32_t o = 0x10u; o < 0x1Cu; o++) rx_wr8(app, p->rx_struct + o, lvl);
     }
     rx_wr8(app, p->rx_struct + 9, lvl);
     rx_wr8(app, p->rx_struct + 0xA, lvl);
@@ -2813,17 +2914,32 @@ static void rx_prime(AppState* app, bool init_level) {
     app->rx_primed = true;
 }
 
-/* Snapshot the protocol handler's result before rx_prime clears transient RX
- * state. This distinguishes a pulse-decoder hit from an upper-layer/UI accept. */
+/* Snapshot the protocol handler's result before the next frame is injected.
+ * This distinguishes a pulse-decoder hit from an upper-layer/UI accept. */
 static void rx_log_firmware_accept(AppState* app, uint8_t id) {
     const ArmProfile* p = app->prof;
     uint8_t result[16];
+    uint8_t status[8];
     char hex[sizeof(result) * 2 + 1];
+    char status_hex[sizeof(status) * 2 + 1];
     for(size_t i = 0; i < sizeof(result); i++) {
-        result[i] = (uint8_t)thumb_read_mem(app->cpu, p->rx_result + (uint32_t)i, 1);
+        /* run_burst may already have consumed and cleared the firmware's
+         * result buffer. Report the immutable pulse-decoder snapshot here. */
+        result[i] = i < sizeof(app->rx_last_frame) ? app->rx_last_frame[i] : 0;
         snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02X", result[i]);
     }
+    /* Pmax's decoder/UI handoff lives after the first 16 raw bytes:
+     * result+0x1F is validated and +0x20 is the brand/family selector. */
+    for(size_t i = 0; i < sizeof(status); i++) {
+        status[i] = p->ui_screen ?
+                        (uint8_t)thumb_read_mem(
+                            app->cpu, p->rx_result + 0x1Fu + (uint32_t)i, 1) :
+                        0xFFu;
+        snprintf(status_hex + i * 2, sizeof(status_hex) - i * 2, "%02X", status[i]);
+    }
     uint8_t decoder = (uint8_t)thumb_read_mem(app->cpu, p->rx_mode, 1);
+    uint8_t pending = (uint8_t)thumb_read_mem(app->cpu, p->rx_pending, 1);
+    uint32_t visible_hash = fb_hash(app);
     if(p->rx_valid && p->rx_brand) {
         uint8_t valid = (uint8_t)thumb_read_mem(app->cpu, p->rx_valid, 1);
         uint8_t brand = (uint8_t)thumb_read_mem(app->cpu, p->rx_brand, 1);
@@ -2833,25 +2949,31 @@ static void rx_log_firmware_accept(AppState* app, uint8_t id) {
         if(p->ui_screen) {
             uint8_t screen = (uint8_t)thumb_read_mem(app->cpu, p->ui_screen, 1);
             uint8_t mode = (uint8_t)thumb_read_mem(app->cpu, p->ui_mode, 1);
-            FURI_LOG_I(TAG,
-                       "RX firmware consumed id=%u decoder=%u screen=%u mode=%u "
-                       "valid=%u brand=%u index=%u result16=%s",
-                       id, decoder, screen, mode, valid, brand, index, hex);
+            uint8_t cursor = p->ui_cursor ?
+                                 (uint8_t)thumb_read_mem(app->cpu, p->ui_cursor, 1) :
+                                 0xFFu;
+            FURI_LOG_I(
+                TAG,
+                "RX handler returned id=%u dec=%u pending=%02X ui=%u/%u/%u "
+                "post[c/d/e]=%u/%u/%u meta=%s captured16=%s fbhash=%08lX",
+                id, decoder, pending, screen, mode, cursor, brand, valid, index,
+                status_hex, hex, (unsigned long)visible_hash);
         } else {
             FURI_LOG_I(TAG,
-                       "RX firmware consumed id=%u decoder=%u valid=%u brand=%u "
-                       "index=%u result16=%s",
-                       id, decoder, valid, brand, index, hex);
+                       "RX handler returned id=%u dec=%u pending=%02X post[c/d/e]=%u/%u/%u "
+                       "meta=%s captured16=%s fbhash=%08lX",
+                       id, decoder, pending, brand, valid, index, status_hex, hex,
+                       (unsigned long)visible_hash);
         }
     } else {
-        FURI_LOG_I(TAG, "RX firmware consumed id=%u decoder=%u result16=%s",
-                   id, decoder, hex);
+        FURI_LOG_I(TAG, "RX handler returned id=%u dec=%u pending=%02X meta=%s captured16=%s fbhash=%08lX",
+                   id, decoder, pending, status_hex, hex, (unsigned long)visible_hash);
     }
 }
 
-/* Inject one captured half-period into the demodulator. Research's
- * dyn_rx_inject.py confirms the 5-tap input filter needs six ISR samples while
- * the GPIO remains at the new level; one call per captured transition starves it. */
+/* Inject one captured half-period into the demodulator. The firmware's 5-tap
+ * filter must settle through repeated real ISR calls; pre-seeding the history
+ * suppresses frames on hardware captures. */
 static bool rx_feed_edge(AppState* app, bool level, uint32_t dur_us) {
     const ArmProfile* p = app->prof;
     app->rx_pulse_ticks = (dur_us * 6u) & 0xFFFFu;
@@ -2864,18 +2986,92 @@ static bool rx_feed_edge(AppState* app, bool level, uint32_t dur_us) {
     rx_wr8(app, p->rx_carrier_gate, level ? 1u : 0u);
 
     app->rx_feeding = true;
-    for(uint32_t sample = 0; sample < RX_ISR_SAMPLES_PER_EDGE; sample++) {
-        /* Hold DATA and TIMER1 width while the 5-tap majority filter settles. */
-        call_subroutine(app, p->demod_isr, 200000);
-        uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
-        if(pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF) break;
-    }
+    /* Hold DATA and TIMER1 width while the firmware's filter settles. */
+    uint8_t samples = p->rx_filter_taps ? p->rx_filter_taps : RX_ISR_SAMPLES_PER_EDGE;
+    call_rx_demod_samples(app, samples);
     app->rx_feeding = false;
     app->rx_prev_level = level;
     app->rx_injected++;
 
     uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
     return pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF;
+}
+
+/* Fast replay path: the SD spool already contains the clean, measured
+ * half-periods. Re-run the firmware's real per-mode decoder dispatch once per
+ * edge and reproduce the width-window shift from the demod ISR. This keeps the
+ * decoder and frame handling firmware-owned while avoiding five complete
+ * majority-filter ISR executions for every stored edge. Live capture still
+ * uses rx_feed_edge() and its full hardware filter model. */
+static bool rx_feed_spooled_edge(AppState* app, bool level, uint32_t dur_us) {
+    const ArmProfile* p = app->prof;
+    ThumbCore* cpu = app->cpu;
+    if(!p->rx_decoder_dispatch || !p->rx_width_cur || !p->rx_width_prev ||
+       !p->rx_width_prev2) {
+        return rx_feed_edge(app, level, dur_us);
+    }
+
+    uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
+    if(pending_off >= PA_RAM_SIZE) return false;
+
+    /* TIMER1 advances at 6 MHz and the firmware stores CNT/6 as microseconds. */
+    uint32_t width_us = ((dur_us * 6u) & 0xFFFFu) / 6u;
+    thumb_write_mem(cpu, p->rx_width_cur, width_us, 4);
+    rx_wr8(app, p->rx_carrier_gate, level ? 1u : 0u);
+    if(level)
+        app->gpio_din[p->data_port] |= (uint16_t)(1u << p->data_pin);
+    else
+        app->gpio_din[p->data_port] &= (uint16_t)~(1u << p->data_pin);
+
+    uint32_t saved_regs[16];
+    memcpy(saved_regs, cpu->r, sizeof(saved_regs));
+    uint32_t saved_xpsr = cpu->xpsr;
+    uint8_t saved_it_cond = cpu->it_cond;
+    uint8_t saved_it_mask = cpu->it_mask;
+    uint8_t saved_halted = cpu->halted;
+    ThumbHook saved_hook = cpu->hook;
+    void* saved_hook_ctx = cpu->hook_ctx;
+    uint32_t saved_next_pc = app->next_pc;
+    bool count_without_hook = app->unlocked && !app->nav_active && !app->knock_active;
+    if(count_without_hook) thumb_set_hook(cpu, NULL, NULL);
+
+    /* The demod ISR enters the dispatcher with r4 pointing at the GPIO/RX
+     * context and r5 at the firmware's state block. */
+    thumb_set_reg(cpu, 4, p->rx_struct);
+    thumb_set_reg(cpu, 5, p->rx_state_base);
+    thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
+    thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
+    thumb_set_reg(cpu, 15, p->rx_decoder_dispatch | 1u);
+    cpu->halted = 0;
+    bool returned = false;
+    for(uint32_t i = 0; i < 200000u; i++) {
+        if((cpu->r[15] & ~1u) == (ARM_CALL_SENTINEL & ~1u)) {
+            returned = true;
+            break;
+        }
+        if(thumb_step(cpu) < 0) break;
+    }
+
+    /* The dispatcher itself does not shift the three-width window; the ISR
+     * epilogue does so after decoding each measured edge. */
+    uint32_t prev = (uint32_t)thumb_read_mem(cpu, p->rx_width_prev, 4);
+    thumb_write_mem(cpu, p->rx_width_prev2, prev, 4);
+    thumb_write_mem(cpu, p->rx_width_prev, width_us, 4);
+
+    if(count_without_hook) {
+        app->ninsn = emu_insn_now(app);
+        app->pc = cpu->r[15] & ~1u;
+    }
+    thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
+    memcpy(cpu->r, saved_regs, sizeof(saved_regs));
+    cpu->xpsr = saved_xpsr;
+    cpu->it_cond = saved_it_cond;
+    cpu->it_mask = saved_it_mask;
+    cpu->halted = saved_halted;
+    app->next_pc = saved_next_pc;
+    app->rx_prev_level = level;
+    app->rx_injected++;
+    return returned && app->ram[pending_off] == 0xFF;
 }
 
 static void rx_preroll_push(AppState* app, const RxEdge* edge) {
@@ -2889,6 +3085,27 @@ static void rx_preroll_push(AppState* app, const RxEdge* edge) {
 }
 
 static bool rx_deliver_edge(AppState* app, const RxEdge* edge);
+
+/* Preserve the player's exact next edge before reusing its RAM buffer for a
+ * new spool writer. play_pos points past the whole loaded batch, so rewind by
+ * the undelivered suffix and let playback refill after capture finishes. */
+static bool rx_spool_suspend_player(AppState* app) {
+    if(app->rx_spool_player < 0) return true;
+    RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_player];
+    uint32_t unread = app->rx_spool_play_count - app->rx_spool_play_index;
+    uint32_t unread_bytes = unread * sizeof(RxEdge);
+    if(unread_bytes > s->play_pos) return false;
+    uint32_t resume_pos = s->play_pos - unread_bytes;
+    if(!storage_file_seek(s->file, resume_pos, true)) {
+        FURI_LOG_E(TAG, "RX spool pause seek failed slot=%c at=%lu",
+                   (char)('A' + app->rx_spool_player), (unsigned long)resume_pos);
+        return false;
+    }
+    s->play_pos = resume_pos;
+    app->rx_spool_play_count = 0;
+    app->rx_spool_play_index = 0;
+    return true;
+}
 
 static int8_t rx_spool_alloc(AppState* app) {
     FS_Error mkdir_err = storage_common_mkdir(app->storage, PA_DATA_DIR);
@@ -2907,9 +3124,16 @@ static int8_t rx_spool_alloc(AppState* app) {
             FURI_LOG_E(TAG, "RX spool open failed slot=%u", i);
             continue;
         }
+        if(!rx_spool_suspend_player(app)) {
+            storage_file_close(s->file);
+            s->state = RxSpoolFree;
+            app->rx_spool_lost++;
+            return -1;
+        }
         s->state = RxSpoolWriting;
         s->bytes = 0;
         s->play_pos = 0;
+        s->drop_start = app->rx_gate_drop_snapshot;
         s->order = ++app->rx_spool_order;
         app->rx_spool_batch_count = 0;
         app->rx_spool_writer = (int8_t)i;
@@ -2927,7 +3151,7 @@ static bool rx_spool_flush(AppState* app) {
     if(app->rx_spool_writer < 0 || app->rx_spool_batch_count == 0) return true;
     RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_writer];
     size_t bytes = (size_t)app->rx_spool_batch_count * sizeof(RxEdge);
-    if(storage_file_write(s->file, app->rx_spool_batch, bytes) != bytes) {
+    if(storage_file_write(s->file, app->rx_spool_buffer, bytes) != bytes) {
         s->write_errors++;
         FURI_LOG_E(TAG, "RX spool write failed slot=%c at=%lu bytes=%lu",
                    (char)('A' + app->rx_spool_writer), (unsigned long)s->bytes,
@@ -2952,6 +3176,18 @@ static void rx_spool_finish(AppState* app) {
     if(!rx_spool_flush(app)) return;
     RxSpool* s = &app->rx_spool[(uint8_t)idx];
     storage_file_close(s->file);
+    uint32_t dropped = __atomic_load_n(&app->rx_dropped, __ATOMIC_RELAXED) - s->drop_start;
+    if(dropped) {
+        s->state = RxSpoolFree; /* truncated waveform is retained until this slot is reused */
+        app->rx_spool_writer = -1;
+        app->rx_capture_blocked = true;
+        app->rx_spool_lost++;
+        FURI_LOG_E(TAG,
+                   "RX spool burst incomplete slot=%c edges=%lu ring_dropped=%lu; retained, not replayed",
+                   (char)('A' + idx), (unsigned long)(s->bytes / sizeof(RxEdge)),
+                   (unsigned long)dropped);
+        return;
+    }
     s->state = RxSpoolReady;
     app->rx_spool_writer = -1;
     app->rx_spool_bursts++;
@@ -2993,7 +3229,7 @@ static void rx_spool_append(AppState* app, const RxEdge* edge) {
         app->rx_spool_lost++;
         return;
     }
-    app->rx_spool_batch[app->rx_spool_batch_count++] = *edge;
+    app->rx_spool_buffer[app->rx_spool_batch_count++] = *edge;
     if(app->rx_spool_batch_count == RX_SPOOL_BATCH) (void)rx_spool_flush(app);
 }
 
@@ -3022,9 +3258,14 @@ static void rx_spool_start_playback(AppState* app) {
     app->rx_spool_player = best;
     FURI_LOG_I(TAG, "RX spool playback start slot=%c edges=%lu",
                (char)('A' + best), (unsigned long)(s->bytes / sizeof(RxEdge)));
+    FURI_LOG_I(TAG,
+               "RX replay path: clean widths -> firmware decoder dispatch @0x%06lX (filter bypass)",
+               (unsigned long)app->prof->rx_decoder_dispatch);
 }
 
 static void rx_spool_play_pump(AppState* app) {
+    /* A new capture owns the shared buffer until its writer is closed. */
+    if(app->rx_spool_writer >= 0) return;
     /* A completed demod frame is consumed by the firmware's foreground RX
      * loop. Give run_burst() a chance to handle rx_pending before clearing the
      * RX state for the next frame. While it remains pending, hold playback;
@@ -3068,7 +3309,7 @@ static void rx_spool_play_pump(AppState* app) {
         uint32_t count = remain < RX_SPOOL_BATCH ? remain : RX_SPOOL_BATCH;
         size_t nbytes = (size_t)count * sizeof(RxEdge);
         bool first_chunk = s->play_pos == 0;
-        size_t got = storage_file_read(s->file, app->rx_spool_play_batch, nbytes);
+        size_t got = storage_file_read(s->file, app->rx_spool_buffer, nbytes);
         if(got != nbytes) {
             int8_t idx = app->rx_spool_player;
             FURI_LOG_E(TAG, "RX spool playback read failed slot=%c at=%lu; file retained",
@@ -3088,13 +3329,18 @@ static void rx_spool_play_pump(AppState* app) {
             /* HAL callback levels describe the pulse that just ended. Seed the
              * emulated DATA pin at that pulse's level before replaying its
              * duration and the following transition. */
-            rx_prime(app, app->rx_spool_play_batch[0].level != 0);
+            rx_prime(app, app->rx_spool_buffer[0].level != 0);
         }
     }
-    while(app->rx_spool_play_index < app->rx_spool_play_count) {
-        RxEdge* edge = &app->rx_spool_play_batch[app->rx_spool_play_index++];
+    uint16_t delivered = 0;
+    while(app->rx_spool_play_index < app->rx_spool_play_count &&
+          delivered < RX_PLAY_MAX_EDGES_PER_PUMP) {
+        RxEdge* edge = &app->rx_spool_buffer[app->rx_spool_play_index++];
+        delivered++;
         /* Let the emulated main loop observe each completed frame before feeding
-         * later frames, as the physical radio ISR would. */
+         * later frames, as the physical radio ISR would. Keep this slice short:
+         * the callback ring must be drained between replay slices or it
+         * overflows while the firmware ISR is being emulated. */
         if(rx_deliver_edge(app, edge)) break;
     }
 }
@@ -3103,7 +3349,7 @@ static bool rx_deliver_edge(AppState* app, const RxEdge* edge) {
     /* FuriHalSubGhzCaptureCallback reports true on a falling edge after the
      * high pulse, and false on a rising edge after the low pulse. The firmware
      * ISR needs the post-edge DATA level, so feed the opposite level. */
-    bool done = rx_feed_edge(app, edge->level == 0, edge->duration);
+    bool done = rx_feed_spooled_edge(app, edge->level == 0, edge->duration);
     if(!done) return false;
 
     app->rx_frames++;
@@ -3138,6 +3384,12 @@ static bool rx_deliver_edge(AppState* app, const RxEdge* edge) {
      * foreground loop has consumed them on the next run_burst(). */
     app->rx_last_frame_id = id;
     app->rx_reprime_pending = true;
+    if(app->prof == &PROFILE_PANDORA && !app->rx_addr_trace_done) {
+        app->rx_addr_trace_left = 30000u;
+        app->rx_drawn_text_len = 0;
+        app->rx_addr_trace_handler_seen = 0;
+        app->rx_addr_trace_done = true;
+    }
     return true;
 }
 
@@ -3187,12 +3439,15 @@ static void rx_bridge_start(AppState* app) {
                       __atomic_load_n(&app->rx_tail, __ATOMIC_ACQUIRE);
     furi_hal_subghz_start_async_rx(radio_rx_callback, app);
     app->rx_running = true;
+    uint8_t isr_calls = app->prof->rx_filter_taps ? app->prof->rx_filter_taps :
+                                                    RX_ISR_SAMPLES_PER_EDGE;
     FURI_LOG_I(TAG,
-               "RX bridge ON (ISR 0x%06lX, DATA B%u.%u, decoder=%u ready=0x%06lX taps=%u queued=%lu, RSSI gate)",
+               "RX bridge ON (ISR 0x%06lX, DATA B%u.%u, decoder=%u ready=0x%06lX filter_taps=%u calls/edge=%u queued=%lu, RSSI gate)",
                (unsigned long)app->prof->demod_isr, app->prof->data_port,
                app->prof->data_pin, decoder_mode,
-               (unsigned long)app->prof->rx_pending, RX_ISR_SAMPLES_PER_EDGE,
-               (unsigned long)queued);
+               (unsigned long)app->prof->rx_pending,
+               app->prof->rx_filter_taps ? app->prof->rx_filter_taps : RX_ISR_SAMPLES_PER_EDGE,
+               isr_calls, (unsigned long)queued);
 }
 
 static void rx_bridge_stop(AppState* app) {
@@ -3205,28 +3460,23 @@ static void rx_bridge_stop(AppState* app) {
     app->rx_capture_active = false;
     app->rx_capture_post_remaining_us = 0;
     rx_spool_finish(app);
-    /* Keep the exact playback cursor across the firmware's READY transition
-     * after a decoded frame. Replaying from edge zero can repeatedly deliver
-     * the same frame and prevent later captured frames from reaching the UI. */
-    if(app->rx_spool_player >= 0 && !app->rx_reprime_pending) {
-        RxSpool* s = &app->rx_spool[(uint8_t)app->rx_spool_player];
-        storage_file_close(s->file);
-        s->play_pos = 0;
-        app->rx_spool_play_count = 0;
-        app->rx_spool_play_index = 0;
-        s->state = RxSpoolReady; /* restart from edge zero; never delete a partial replay */
-        app->rx_spool_player = -1;
-    }
+    /* Leave an in-progress playback file and cursor intact. The firmware
+     * briefly switches READY while consuming each frame; RX resumes on the
+     * next loop, where the same player continues from the next edge. */
     FURI_LOG_I(TAG, "RX bridge OFF (%lu edges injected, %lu frames)",
                (unsigned long)app->rx_injected, (unsigned long)app->rx_frames);
 }
 
 /* Drain capture into bounded SD bursts, then replay each burst to the firmware ISR. */
-static void rx_bridge_pump(AppState* app) {
+static void rx_bridge_pump(AppState* app, bool replay) {
     if(!app->rx_running) return;
     RxEdge e;
     uint32_t processed = 0;
-    while(processed < RX_PUMP_MAX_EDGES && radio_rx_dequeue(app, &e)) {
+    /* Empty the currently queued capture in one pass. Capping this at half the
+     * ring left a large backlog while the SD spool was doing synchronous
+     * writes, so the capture ISR could wrap and discard the rest of a burst. */
+    uint32_t pump_limit = app->rx_ring_capacity;
+    while(processed < pump_limit && radio_rx_dequeue(app, &e)) {
         processed++;
         if(e.gate_open) {
             if(!app->rx_capture_active && !app->rx_capture_blocked) {
@@ -3268,7 +3518,7 @@ static void rx_bridge_pump(AppState* app) {
             app->rx_capture_blocked = false;
         }
     }
-    rx_spool_play_pump(app);
+    if(replay) rx_spool_play_pump(app);
     if(processed) app->buzz_request = false;
 }
 
@@ -3773,7 +4023,7 @@ static void run_emulator(AppState* app, Gui* gui) {
     Canvas* canvas = NULL;
     bool fb_cb_added = false;
 
-    if(!app->rx_ring || !app->rx_ring_capacity) {
+    if(!app->rx_ring_storage || !app->rx_ring_capacity) {
         FURI_LOG_E(TAG, "rx ring unavailable");
         return;
     }
@@ -3903,6 +4153,12 @@ static void run_emulator(AppState* app, Gui* gui) {
          * the current gate bit and stays constant-time. */
         rx_rssi_update(app);
 
+        /* Drain the capture ring before running another firmware slice. During
+         * RX the host radio can produce edges faster than the emulator's
+         * foreground instruction loop; postponing this drain until afterward
+         * needlessly consumes ring headroom and delays completed-frame handoff. */
+        rx_bridge_pump(app, false);
+
         /* run a slice of the real firmware (captures TX via mmio_write).
          * EMU_INSN_PER_FRAME caps how much firmware runs per UI frame. The
          * firmware has an inactivity timeout (~280k insn) that returns a
@@ -3910,6 +4166,10 @@ static void run_emulator(AppState* app, Gui* gui) {
          * it fire instantly; this value keeps it at a human scale. Tune on real
          * hardware if the pacing feels off (lower = slower fw / longer timeout). */
         run_burst(app, app->rx_running ? EMU_INSN_PER_RX_FRAME : EMU_INSN_PER_FRAME);
+        /* Drain once more after the firmware slice to collect edges captured
+         * while the interpreter was running. Replay is kept here so a frame
+         * decoded in the slice is consumed by firmware before more edges feed. */
+        rx_bridge_pump(app, true);
 
         /* DIAG: heartbeat every ~2s so we can confirm the loop keeps running and
          * measure the REAL emulation rate on hardware (insn/s = ninsn delta / dt).
@@ -3961,10 +4221,19 @@ static void run_emulator(AppState* app, Gui* gui) {
                 uint32_t dd = dropped - app->rx_dropped_hb;
                 uint32_t gate_opens = app->rx_gate_open_count;
                 uint32_t gate_closes = app->rx_gate_close_count;
+                uint32_t play_done = 0;
+                uint32_t play_total = 0;
+                if(app->rx_spool_player >= 0) {
+                    RxSpool* playing = &app->rx_spool[(uint8_t)app->rx_spool_player];
+                    play_total = playing->bytes / sizeof(RxEdge);
+                    play_done = playing->play_pos / sizeof(RxEdge);
+                    uint32_t unread = app->rx_spool_play_count - app->rx_spool_play_index;
+                    play_done = play_done >= unread ? play_done - unread : 0;
+                }
                 FURI_LOG_I(
                     TAG,
                     "RX: @%luHz air=+%lu in=%lu q=%lu drop=+%lu gate=%u RSSI=%.1f/%.1f/%.1f "
-                    "gate_evt=+%lu/-%lu spool=%lu replay=%lu lost=%lu frame=+%lu/%lu",
+                    "gate_evt=+%lu/-%lu spool=%lu play=%lu/%lu replay=%lu lost=%lu frame=+%lu/%lu",
                     (unsigned long)app->frequency, (unsigned long)de,
                     (unsigned long)app->rx_injected, (unsigned long)queued,
                     (unsigned long)dd,
@@ -3974,6 +4243,7 @@ static void run_emulator(AppState* app, Gui* gui) {
                     (unsigned long)(gate_opens - app->rx_gate_open_hb),
                     (unsigned long)(gate_closes - app->rx_gate_close_hb),
                     (unsigned long)app->rx_spool_bursts,
+                    (unsigned long)play_done, (unsigned long)play_total,
                     (unsigned long)app->rx_spool_replayed,
                     (unsigned long)app->rx_spool_lost,
                     (unsigned long)df, (unsigned long)app->rx_frames);
@@ -3991,7 +4261,6 @@ static void run_emulator(AppState* app, Gui* gui) {
          * demodulated OOK stream into PB0 for the firmware's demod ISR. There is
          * no FIFO/packet path (removed; DYN_HW_D605.md: 0 FIFO accesses). */
         tx_bridge_flush(app);
-        rx_bridge_pump(app); /* direct/bit-bang RX (SW demod via PB0) */
 
         /* tentative buzzer beep: non-blocking, owns the shared speaker only while
          * active and releases it as soon as the firmware's buzzer burst ceases. */
@@ -4008,12 +4277,26 @@ static void run_emulator(AppState* app, Gui* gui) {
         if(oled_changed || refresh_due) {
             render_oled(app);
             if(app->rx_frames && oled_changed) {
-                uint16_t lit_bytes = 0;
-                for(size_t i = 0; i < FB_SIZE; i++)
-                    if(app->screen[i]) lit_bytes++;
-                FURI_LOG_I(TAG, "RX UI render oled=%lu lit_bytes=%u gui_commit=%u",
-                           (unsigned long)app->oled_frames, (unsigned)lit_bytes,
-                           (unsigned)!app->menu_active);
+                uint16_t lit_pixels = 0;
+                int min_x = SCREEN_W, min_y = SCREEN_H;
+                int max_x = -1, max_y = -1;
+                for(int y = 0; y < SCREEN_H; y++) {
+                    for(int x = 0; x < SCREEN_W; x++) {
+                        size_t idx = (size_t)(y >> 3) * SCREEN_W + (size_t)x;
+                        if(app->screen[idx] & (uint8_t)(1u << (y & 7))) {
+                            lit_pixels++;
+                            if(x < min_x) min_x = x;
+                            if(x > max_x) max_x = x;
+                            if(y < min_y) min_y = y;
+                            if(y > max_y) max_y = y;
+                        }
+                    }
+                }
+                FURI_LOG_I(TAG,
+                           "RX UI render oled=%lu src=92x64/2bpp crop=88 offset=20 "
+                           "lit=%u bbox=%d,%d-%d,%d gui_commit=%u",
+                           (unsigned long)app->oled_frames, (unsigned)lit_pixels,
+                           min_x, min_y, max_x, max_y, (unsigned)!app->menu_active);
             }
             if(!app->menu_active) canvas_commit(canvas);
             rendered_oled_frames = app->oled_frames;
@@ -4059,9 +4342,11 @@ teardown:
     FURI_LOG_D(TAG, "teardown: inflight drained");
     if(canvas) gui_direct_draw_release(gui);
     FURI_LOG_D(TAG, "teardown: direct_draw released");
-    if(app->rx_ring) {
-        free(app->rx_ring);
-        app->rx_ring = NULL;
+    if(app->rx_ring_storage) {
+        free(app->rx_ring_storage);
+        app->rx_ring_storage = NULL;
+        app->rx_ring_duration = NULL;
+        app->rx_ring_flags = NULL;
     }
     FURI_LOG_D(TAG, "emulator: exit");
 }
@@ -4170,25 +4455,28 @@ int32_t pandora_arm_app(void* p) {
             memset(app->ram, 0, PA_RAM_SIZE);
 
             /* Reserve RX transfer memory before the flash cache takes the
-             * remaining heap. The SD spool stores whole RSSI bursts, so this
-             * queue is only a producer/consumer cushion; keep the largest ring
-             * that fits and degrade gracefully instead of aborting emulation. */
-            /* Preserve the full RX cushion where possible. If fragmented heap
-             * prevents it, smaller fallbacks still let the SD spool retain the
-             * complete RSSI burst; fc_init then protects its minimum boot cache. */
-            static const uint16_t rx_ring_sizes[] = {RX_RING_MAX_LEN, 1024u, 512u};
+             * remaining heap. Keep this staging ring compact: the SD spool is
+             * the long-burst store, while the ring only bridges capture to the
+             * emulator. The 2-bit flags keep 2048 edges at 4608 bytes, leaving
+             * enough heap for the minimum three 4KB flash-cache pages. */
+            static const uint16_t rx_ring_sizes[] = {
+                RX_RING_MAX_LEN, 1536u, 1024u, 512u};
             for(size_t i = 0; i < COUNT_OF(rx_ring_sizes); i++) {
                 uint16_t capacity = rx_ring_sizes[i];
-                app->rx_ring = (RxEdge*)safe_malloc((size_t)capacity * sizeof(RxEdge));
-                if(app->rx_ring) {
+                size_t duration_bytes = (size_t)capacity * sizeof(uint16_t);
+                size_t flags_bytes = ((size_t)capacity + 3u) / 4u;
+                app->rx_ring_storage = (uint8_t*)safe_malloc(duration_bytes + flags_bytes);
+                if(app->rx_ring_storage) {
                     app->rx_ring_capacity = capacity;
-                    memset(app->rx_ring, 0, (size_t)capacity * sizeof(RxEdge));
+                    app->rx_ring_duration = (uint16_t*)app->rx_ring_storage;
+                    app->rx_ring_flags = app->rx_ring_storage + duration_bytes;
+                    memset(app->rx_ring_storage, 0, duration_bytes + flags_bytes);
                     FURI_LOG_I(TAG, "RX ring reserved: %u edges (%u bytes)", capacity,
-                               (unsigned)(capacity * sizeof(RxEdge)));
+                               (unsigned)(duration_bytes + flags_bytes));
                     break;
                 }
             }
-            if(!app->rx_ring) {
+            if(!app->rx_ring_storage) {
                 FURI_LOG_E(TAG, "RX ring allocation failed (free=%uK max=%uK)",
                            (unsigned)(memmgr_get_free_heap() / 1024u),
                            (unsigned)(memmgr_heap_get_max_free_block() / 1024u));
@@ -4250,10 +4538,16 @@ int32_t pandora_arm_app(void* p) {
     /* --- teardown --- */
     if(app->cpu) free(app->cpu);
     fc_deinit(&app->fc); /* free the 4KB slots + bookkeeping + close the .bin */
+    /* The selected HEX/BIN remains the source of truth. This canonical flat
+     * image is only a paging backing file for this app session, so remove it
+     * after closing the cache to reclaim SD space on normal exit or load error. */
+    if(app->storage) (void)storage_common_remove(app->storage, PA_FLASH_BIN);
     if(app->ram) free(app->ram);
-    if(app->rx_ring) {
-        free(app->rx_ring);
-        app->rx_ring = NULL;
+    if(app->rx_ring_storage) {
+        free(app->rx_ring_storage);
+        app->rx_ring_storage = NULL;
+        app->rx_ring_duration = NULL;
+        app->rx_ring_flags = NULL;
         app->rx_ring_capacity = 0;
     }
     if(app->fb_mutex) furi_mutex_free(app->fb_mutex);
