@@ -164,195 +164,88 @@ static void* safe_malloc(size_t size) {
     return malloc(size);
 }
 
-/* ------------------------------------------------------------ HW profiles */
-
+/* ------------------------------------------------------------ HW profile ----
+ *
+ * AGNOSTIC HARDWARE PROFILE (ported from the ESP32 port's PROFILE_PANDORA_HW and
+ * pandora_tui.py's `HW` dict).
+ *
+ * This struct now describes ONLY the PHYSICAL hardware of the D650 keyfob, which
+ * is IDENTICAL for every firmware of this MCU. It contains NO firmware-internal
+ * code/RAM address: no scan_head / spin_heads / unlock_pc / nav_reader /
+ * demod_isr / rx_decoder_dispatch / rx_* RAM offsets / ui_* / fb_addr / knock /
+ * flash_used. All I/O is done through GPIO pins and the SPI bus as on the real
+ * hardware, so the SAME profile runs ANY .hex for this MCU.
+ *
+ * What used to be per-firmware is handled agnostically:
+ *   - flash size is derived from the loaded firmware image length at load time
+ *     (fc.flash_used), NOT a hardcoded ArmProfile.flash_used.
+ *   - the knock-code is FIRMWARE CONFIG (not hardware): it lives in AppState
+ *     (knock_user, set by the host/UI) and is pressed PURELY over GPIO by
+ *     auto_unlock, exactly like the ESP32 emu_set_knock / pandora_tui.py.
+ *   - unlock is an OBSERVABLE signal (framebuffer has lit pixels), not a code
+ *     address.
+ *   - the LED/buzzer are detected generically from GPIO activity (no led_port).
+ */
 typedef struct {
     const char* name;
-    uint32_t flash_used; /* real size of the code in flash (only this is allocated,
-                          * NOT the full 264KB: the Flipper has little heap) */
-    uint32_t fb_addr; /* framebuffer in RAM */
-    /* buttons (port, pin) */
+    /* 6 physical buttons -> (port, pin) GPIO DIN (pull-up, active-low).
+     * Identical in every firmware of this keyfob (verified by RE).
+     * NOTE: BACK=(0,15) for ALL firmwares. The old 'pandora' profile had
+     * BACK=(2,7) which was a BUG: PC7=(2,7) is a vestigial OUTPUT, not a
+     * button. Fixed for all (matches PANDORAMAX and the ESP32 port). */
     uint8_t up_port, up_pin;
     uint8_t down_port, down_pin;
     uint8_t ok_port, ok_pin;
     uint8_t back_port, back_pin;
     uint8_t b5_port, b5_pin;
     uint8_t b6_port, b6_pin;
-    /* knock-code: up to 8 steps, terminated with 0xFF */
-    uint8_t knock[8];
-    uint8_t knock_len;
-    uint8_t gate; /* button of the 2nd gate (BTN_* index) */
-    uint32_t scan_head; /* head of the knock scanner */
-    uint32_t spin_heads[8]; /* heads wait-release */
-    uint8_t spin_count;
-    uint32_t unlock_pc; /* bl unlock routine = completed */
-    uint32_t nav_reader; /* read_gpio_pin inlined used POST-unlock (nav_button):
-                          * pandora=0x97ac, pmax=0x96ec. r0=port, r1=pin. */
-
-    /* --- physical outputs of the keyfob mapped to the Flipper (LED / buzzer) --- */
-    uint8_t led_port; /* GPIO port driving the indicator LED. pandora: port3 (D) */
-    uint8_t led_pin; /* GPIO pin of the indicator LED. pandora: pin14 (bit 0x4000).
-                      * See RE_DYN_pandora.md: "DOUT(port3) ^= 0x4000 ; blink LED". */
-
-    /* --- RF bridge (direct-mode software demod; see DYN_HW_D605.md) ---
-     * BOTH firmwares use the Si4432 in DIRECT mode (bit-bang OOK/FSK), NOT the
-     * FIFO/packet mode -- confirmed by dynamic analysis (0 FIFO 0x7F accesses in
-     * RX). The old "pmax = HW FIFO" was wrong. The radio is wired identically on
-     * both: CS=PE9 (active-high), antenna PE14=RX/PE15=TX, RX-data pin=PB0 (the
-     * demod ISR samples it), TX-data pin=PB3 (the firmware bit-bangs the OOK
-     * waveform there). The CC1101 bridge: on RXON feed the demodulated OOK into
-     * PB0; on TXON read the PB3 waveform and transmit it. */
-    bool rf_sw_demod; /* true: SW demodulation via ISR (BOTH firmwares) */
-    uint32_t demod_isr; /* demod ISR: pandora=0x09554, pmax=0x0945C */
-    /* RX replay may feed the measured pulse width straight to the firmware's
-     * decoder dispatcher, skipping the expensive GPIO majority-filter pass. */
-    uint32_t rx_decoder_dispatch; /* pandora=0x096D6, pmax=0x095F0 */
-    uint32_t rx_state_base;
-    uint32_t rx_width_cur, rx_width_prev, rx_width_prev2;
-    uint8_t data_port; /* RX-data pin port: PB0 -> port1 */
-    uint8_t data_pin; /* RX-data pin: PB0 -> pin0 */
-    uint8_t tx_data_port; /* TX-data pin port: PB3 -> port1 */
-    uint8_t tx_data_pin; /* TX-data pin: PB3 -> pin3 */
-    uint8_t rf_cs_port; /* Si4432 CS: PE9 -> port4 */
-    uint8_t rf_cs_pin; /* Si4432 CS pin: PE9 -> pin9 (active-high) */
-    uint8_t rf_ant_rx_port, rf_ant_rx_pin; /* RX antenna: PE14 -> port4/pin14 */
-    uint8_t rf_ant_tx_port, rf_ant_tx_pin; /* TX antenna: PE15 -> port4/pin15 */
-    uint16_t rf_tx_cell_us; /* OOK short-cell duration (pandora 400, pmax 500) */
-    uint32_t timer1_cnt; /* TIMER1_CNT MMIO (0x40010424) = width timer */
-    uint32_t rx_struct; /* base of the RX structure (0x20000000) */
-    uint32_t rx_gate; /* active receiver gate (!=0xFF) */
-    uint32_t rx_carrier_gate; /* decoder edge gate, profile-specific RAM byte */
-    uint32_t rx_mode; /* decoder selector (profile-specific) */
-    uint32_t rx_pending; /* profile-specific frame-ready flag; 0xFF = completed */
-    uint32_t rx_state; /* profile-specific decoder/protocol id */
-    uint32_t rx_result; /* profile-specific decoded frame buffer */
-    uint32_t ui_screen; /* optional firmware UI state address for diagnostics */
-    uint32_t ui_mode; /* optional firmware UI mode address for diagnostics */
-    uint32_t ui_cursor; /* optional firmware UI cursor address for diagnostics */
-    uint32_t rx_valid; /* optional decoded-result validity byte */
-    uint32_t rx_brand; /* optional decoded-result brand byte */
-    uint32_t rx_index; /* optional decoded-result display/menu index byte */
-    uint8_t rx_filter_taps; /* Pandora RX history at rx_struct+0x10; 0 if unknown */
-    bool rx_reset_state; /* rx_state is transient and can be reset on arm */
-    bool rx_metadata_after_handler; /* metadata is populated by foreground, not ISR */
-    uint8_t rx_scratch_sp_valid; /* 1 if the scratch SP should be used to call the ISR */
+    uint8_t gate; /* button of the final held unlock gate (BTN_* index) */
+    /* RF pins (Si4432 direct mode, bit-bang OOK/FSK). Identical on both fw. */
+    uint8_t data_port, data_pin;       /* RX-data pin (PB0 = port1.0) */
+    uint8_t tx_data_port, tx_data_pin; /* TX-data pin (PB3 = port1.3) */
+    uint8_t rf_cs_port, rf_cs_pin;     /* Si4432 CS (PE9 = port4.9, active-high) */
+    uint8_t rf_ant_rx_port, rf_ant_rx_pin; /* RX antenna (PE14 = port4.14) */
+    uint8_t rf_ant_tx_port, rf_ant_tx_pin; /* TX antenna (PE15 = port4.15) */
+    uint16_t rf_tx_cell_us; /* default OOK cell width (us), order-of-magnitude */
 } ArmProfile;
 
 /* logical button indices */
 enum { B_UP = 0, B_DOWN, B_OK, B_BACK, B5, B6, BTN_COUNT };
 
-static const ArmProfile PROFILE_PANDORA = {
-    .name = "pandora",
-    .flash_used = 0x13800u, /* code up to 0x135FF (~77KB) + margin */
-    .fb_addr = 0x20001152u,
+/* The ONE hardware profile of the D650 keyfob. AGNOSTIC: no firmware code/RAM
+ * address, no per-firmware knock, no flash_used. The SAME profile runs ANY
+ * .hex for this MCU. (Ported from the ESP32 PROFILE_PANDORA_HW.) */
+static const ArmProfile PROFILE_PANDORA_HW = {
+    .name = "pandora-d650-hw",
     .up_port = 5, .up_pin = 7,
     .down_port = 5, .down_pin = 5,
     .ok_port = 2, .ok_pin = 9,
-    .back_port = 2, .back_pin = 7,
+    .back_port = 0, .back_pin = 15, /* FIX: BACK=(0,15) for ALL firmwares */
     .b5_port = 0, .b5_pin = 1,
     .b6_port = 0, .b6_pin = 6,
-    .knock = {B_UP, B_OK, B_OK, B_UP, B_UP, B_DOWN, 0xFF, 0xFF},
-    .knock_len = 6,
     .gate = B5,
-    .scan_head = 0xFDFAu,
-    .spin_heads = {0xFE5E, 0xFE82, 0xFE9A, 0xFEB2, 0xFECC, 0xFEF4, 0xFF12, 0},
-    .spin_count = 7,
-    .unlock_pc = 0xD108u,
-    .nav_reader = 0x97ACu,
-    /* indicator LED: GPIO port3 (D) pin14 (bit 0x4000), confirmed by the RE. */
-    .led_port = 3,
-    .led_pin = 14,
-    /* RF bridge (DYN_HW_D605.md): direct-mode SW demod, ISR 0x09554.
-     * RX-data=PB0, TX-data=PB3, CS=PE9, antenna PE14(RX)/PE15(TX). */
-    .rf_sw_demod = true,
-    .demod_isr = 0x09554u,
-    .rx_decoder_dispatch = 0x096D6u,
-    .rx_state_base = 0x200005C0u,
-    .rx_width_cur = 0x200005D8u,
-    .rx_width_prev = 0x200005DCu,
-    .rx_width_prev2 = 0x200005E0u,
-    .data_port = 1, /* PB0 = RX-data */
-    .data_pin = 0,
-    .tx_data_port = 1, .tx_data_pin = 3, /* PB3 = TX-data (OOK bit-bang) */
-    .rf_cs_port = 4, .rf_cs_pin = 9, /* PE9 = Si4432 CS (active-high) */
+    /* radio Si4432 (direct mode) pins */
+    .data_port = 1, .data_pin = 0,       /* PB0 = RX-data */
+    .tx_data_port = 1, .tx_data_pin = 3, /* PB3 = TX-data */
+    .rf_cs_port = 4, .rf_cs_pin = 9,     /* PE9 = Si4432 CS (active-high) */
     .rf_ant_rx_port = 4, .rf_ant_rx_pin = 14, /* PE14 = RX antenna/LNA */
     .rf_ant_tx_port = 4, .rf_ant_tx_pin = 15, /* PE15 = TX antenna/PA */
-    .rf_tx_cell_us = 400, /* OOK short cell (long = 2x) */
-    .timer1_cnt = 0x40010424u,
-    .rx_struct = 0x20000000u,
-    .rx_gate = 0x2000000Fu,
-    .rx_carrier_gate = 0x20000009u,
-    .rx_mode = 0x200005BCu,
-    .rx_pending = 0x200005C0u,
-    .rx_state = 0x200005C1u,
-    .rx_result = 0x20001714u,
-    .rx_brand = 0x20001720u, /* result struct +0x0C */
-    .rx_valid = 0x20001721u, /* result struct +0x0D */
-    .rx_index = 0x20001722u, /* result struct +0x0E */
-    .rx_filter_taps = 5,
-    .rx_reset_state = true,
-    .rx_metadata_after_handler = true,
-    .rx_scratch_sp_valid = 1,
+    .rf_tx_cell_us = 400,
 };
-static const ArmProfile PROFILE_PANDORAMAX = {
-    .name = "pandoramax",
-    .flash_used = 0x15400u, /* code up to 0x150FF (~84KB) + margin */
-    .fb_addr = 0x200005DAu,
-    .up_port = 5, .up_pin = 7,
-    .down_port = 5, .down_pin = 5,
-    .ok_port = 2, .ok_pin = 9,
-    .back_port = 0, .back_pin = 15,
-    .b5_port = 0, .b5_pin = 1,
-    .b6_port = 0, .b6_pin = 6,
-    .knock = {B_UP, B_OK, B_DOWN, B_OK, B_UP, B_DOWN, 0xFF, 0xFF},
-    .knock_len = 6,
-    .gate = B5,
-    .scan_head = 0x112E4u,
-    .spin_heads = {0x1135A, 0x11382, 0x1139A, 0x113B2, 0x113CA, 0x113E2, 0x1144C, 0x11464},
-    .spin_count = 8,
-    .unlock_pc = 0xD6E4u,
-    .nav_reader = 0x96ECu,
-    /* indicator LED: NOT confirmed by the RE for pmax. Default to the pandora
-     * mapping (port3/pin14); if the pmax LED sits elsewhere the LED logs will
-     * reveal the real pin (look for the "LED:" throttled log). */
-    .led_port = 3,
-    .led_pin = 14,
-    /* RF bridge (RE_RADIO_D605.md): pmax uses the SAME DIRECT mode as pandora
-     * (NOT FIFO -- confirmed by dynamic analysis, 0 FIFO accesses). demod ISR is
-     * 0x0945C; radio pins identical (RX-data=PB0, TX-data=PB3, CS=PE9, antenna
-     * PE14/PE15). Its RX mode/state layout differs from pandora. */
-    .rf_sw_demod = true,
-    .demod_isr = 0x0945Cu,
-    .rx_decoder_dispatch = 0x095F0u,
-    .rx_state_base = 0x2000003Cu,
-    .rx_width_cur = 0x20000054u,
-    .rx_width_prev = 0x20000058u,
-    .rx_width_prev2 = 0x2000005Cu,
-    .data_port = 1, /* PB0 = RX-data */
-    .data_pin = 0,
-    .tx_data_port = 1, .tx_data_pin = 3, /* PB3 = TX-data (OOK bit-bang) */
-    .rf_cs_port = 4, .rf_cs_pin = 9, /* PE9 = Si4432 CS (active-high) */
-    .rf_ant_rx_port = 4, .rf_ant_rx_pin = 14, /* PE14 = RX antenna/LNA */
-    .rf_ant_tx_port = 4, .rf_ant_tx_pin = 15, /* PE15 = TX antenna/PA */
-    .rf_tx_cell_us = 500, /* OOK short cell (long = 2x) */
-    .timer1_cnt = 0x40010424u,
-    .rx_struct = 0x20000000u,
-    .rx_gate = 0x20000010u,
-    .rx_carrier_gate = 0x2000000Au,
-    .rx_mode = 0x20000038u,
-    .rx_pending = 0x2000003Du,
-    .rx_state = 0x2000003Eu,
-    .rx_result = 0x20000B9Cu,
-    .ui_screen = 0x20000037u,
-    .ui_mode = 0x20000038u,
-    .ui_cursor = 0x20000039u,
-    .rx_valid = 0x20000BBBu,
-    .rx_brand = 0x20000BBCu,
-    .rx_index = 0,
-    .rx_filter_taps = 0,
-    .rx_reset_state = false,
-    .rx_scratch_sp_valid = 0,
-};
+
+/* COMPAT: legacy names still referenced by the code. Both alias the SINGLE
+ * hardware profile above (there is no per-firmware profile any more), exactly
+ * as the ESP32 port did. */
+#define PROFILE_PANDORA PROFILE_PANDORA_HW
+#define PROFILE_PANDORAMAX PROFILE_PANDORA_HW
+
+/* Default knock-codes for the two known keyfob builds. This is FIRMWARE CONFIG
+ * (model-specific), NOT hardware -- the agnostic core neither knows nor needs
+ * it. The host/UI supplies it; auto_unlock presses it PURELY over GPIO. If a
+ * firmware is unknown we press no default (the user enters the PIN in the UI).
+ * Ported from pandora_tui.py _LEGACY_KNOCK. */
+static const uint8_t KNOCK_PANDORA[] = {B_UP, B_OK, B_OK, B_UP, B_UP, B_DOWN};
+static const uint8_t KNOCK_PMAX[] = {B_UP, B_OK, B_DOWN, B_OK, B_UP, B_DOWN};
 
 /* ------------------------------------------------------------ Si4432 model */
 
@@ -676,36 +569,37 @@ typedef struct {
     uint32_t timer_top[4]; /* TOP configured by the firmware (wrap) */
     uint32_t timer_rate[4]; /* CNT advance per instruction (HFPERCLK proxy) */
 
-    /* minimal NVIC */
+    /* --- AGNOSTIC NVIC (driven by the firmware's REAL ISER/ICER) --- */
     uint8_t in_irq;
     uint8_t irq_rr;
     uint32_t tick_count;
     uint64_t last_tick_insn;
-    uint32_t wfi_pc_hint;
+    uint32_t wfi_pc_hint; /* first WFI addr (compat / fast stuck-WFI check) */
+    /* Mask of IRQs the firmware has ENABLED right now (NVIC ISER set / ICER
+     * clear). 64 bits so IRQ numbers up to ~63 are covered (this MCU uses up to
+     * ~IRQ36). Bit N = IRQ N. Ported from pandora_tui.py _nvic_enabled and the
+     * ESP32 port. The old NVIC ignored the ISER entirely (bug). */
+    uint64_t nvic_enabled;
+    /* SCB->VTOR (0xE000ED08) the firmware installs at runtime. Stored here
+     * because the PPB has no backing memory; cur_vtor reads it. Agnostic. */
+    uint32_t ppb_vtor;
+    /* WFI/WFE skip set: absolute addresses of WFI(0xBF30)/WFE(0xBF20) opcodes,
+     * scanned agnostically from flash (from 0x40) and -- post-boot -- RAM. Not a
+     * per-firmware address. Ported from the ESP32 wfi_set / _wfi_set. */
+    uint32_t* wfi_set;
+    uint32_t wfi_count;
+    uint32_t wfi_cap;
+    uint8_t wfi_ram_scanned; /* RAM rescanned once after boot (app-in-RAM case) */
 
-    /* knock FSM (PC-synchronized button injection) */
-    const uint8_t* knock_seq;
-    uint8_t knock_len;
-    uint8_t knock_idx;
-    uint8_t knock_sub; /* 0 press, 1 waitrelease */
-    uint8_t knock_cur;
-    uint8_t knock_spins;
-    uint8_t knock_active;
-    uint8_t unlocked;
-    int max_step;
+    uint8_t unlocked; /* OBSERVABLE: set when the framebuffer has lit pixels */
+    int max_step; /* inert, kept for struct/wire compat */
 
-    /* nav FSM (POST-unlock button injection, synchronized with nav_reader).
-     * Replica of nav_button()/_nav_hook in pandora_tui.py. Shares the SINGLE
-     * per-instruction hook (code_hook) with the knock FSM: code_hook calls
-     * nav_step() when nav_active, exactly as it calls knock_step() when
-     * knock_active (the core only exposes ONE thumb_set_hook). */
-    uint8_t nav_active; /* 1 while a nav_button injection is in progress */
-    uint8_t nav_phase; /* 0 press, 1 hold, 2 done */
-    uint8_t nav_port; /* GPIO port of the button being injected */
-    uint8_t nav_pin; /* GPIO pin of the button being injected */
-    uint8_t nav_btn; /* logical BTN_* index being injected */
-    uint32_t nav_reads; /* count of reader re-reads of THIS pin during hold */
-    uint32_t nav_reads_target; /* hold_reads (short) or long_reads (long press) */
+    /* knock-code (FIRMWARE CONFIG, set by the host/UI). Pressed PURELY over GPIO
+     * as an autotest at reset (no PC-sync, no scanner-address). Agnostic.
+     * Ported from the ESP32 emu_set_knock. */
+    const uint8_t* knock_seq; /* active sequence (points to knock_user or a default) */
+    uint8_t knock_len;        /* length of the active sequence */
+    int knock_gate;           /* B_* index of the final held gate, or -1 */
 
     /* buttons (logical mask) */
     uint8_t btn_pressed[BTN_COUNT];
@@ -778,17 +672,13 @@ typedef struct {
     uint32_t rx_injected; /* edges actually delivered to the emulated demod ISR */
     uint32_t rx_dropped; /* edges rejected because the RX queue was full */
     uint32_t rx_gate_drop_snapshot; /* rx_dropped when the RSSI gate opened */
-    uint32_t rx_frames; /* frames decoded by the firmware */
+    uint32_t rx_frames; /* frames observed (OLED redrew after an RX inject) */
     bool rx_last_frame_valid; /* suppress repeated identical frame log lines */
     uint8_t rx_last_frame_id;
-    uint8_t rx_last_frame[12];
-    /* Short instruction-hook window after a decoded frame. Used only to map
-     * the firmware's real RX handler -> draw_char path; disabled otherwise. */
-    uint32_t rx_addr_trace_left;
-    char rx_drawn_text[48];
-    uint8_t rx_drawn_text_len;
-    uint8_t rx_addr_trace_handler_seen;
-    bool rx_addr_trace_done;
+    /* NOTE: the per-firmware RX trace fields (rx_last_frame[12] raw buffer,
+     * rx_addr_trace_*, rx_drawn_text[48]) were REMOVED with the agnostic RX port
+     * -- they read firmware code/RAM addresses (draw_char @0xA060, dispatch
+     * @0xD16C, rx_result RAM) which no longer exist. Saves ~62 B of AppState. */
     RxEdge rx_preroll[RX_PREROLL_LEN]; /* recent raw edges before RSSI gate opens */
     volatile uint16_t rx_preroll_head;
     volatile uint16_t rx_preroll_count;
@@ -855,6 +745,12 @@ typedef struct {
     uint64_t ninsn;
     uint32_t pc;
     uint32_t next_pc;
+
+    /* AGNOSTIC: effective flash size, DERIVED from the loaded firmware image
+     * (highest address written / file size, page-aligned), NOT a per-firmware
+     * ArmProfile.flash_used constant. Set by flatten_firmware, consumed by
+     * fc_init. Mirrors the ESP32 port's emu_init flash sizing. */
+    uint32_t flash_used;
 
     /* --- user-defined knock-code (menu) --- */
     uint8_t knock_user[16]; /* button sequence (B_* indices) */
@@ -997,6 +893,11 @@ static uint32_t mmio_read(void* ctx, uint32_t addr, int size) {
                 (emu_insn_now(app) - app->timer_t0[tn]) * (uint64_t)app->timer_rate[tn];
             v = (elapsed >= top) ? 1u : 0u;
         }
+    } else if(addr == 0xE000ED08u) {
+        /* SCB->VTOR read-back: the PPB has no backing memory in the core, so we
+         * return the value the firmware last installed (stored in ppb_vtor).
+         * Agnostic (ported from the ESP32 port). */
+        v = app->ppb_vtor;
     }
     (void)size;
     return v;
@@ -1056,26 +957,11 @@ static void oled_commit(AppState* app) {
     memcpy(app->oled_fb, app->oled_work, OLED_FB_SIZE);
     app->oled_work_dirty = 0;
     app->oled_frames++;
+    /* AGNOSTIC RX commit diagnostic: an observable framebuffer bbox + nonzero,
+     * with NO firmware RAM address (the old code read profile rx_valid/rx_brand/
+     * ui_* offsets). When a frame was just RX-decoded (rx_reprime_pending) log
+     * the visible change so a human can confirm the firmware redrew. */
     if(app->rx_reprime_pending) {
-        const ArmProfile* p = app->prof;
-        uint8_t valid = p->rx_valid ?
-                            (uint8_t)thumb_read_mem(app->cpu, p->rx_valid, 1) :
-                            0xFFu;
-        uint8_t brand = p->rx_brand ?
-                            (uint8_t)thumb_read_mem(app->cpu, p->rx_brand, 1) :
-                            0xFFu;
-        uint8_t index = p->rx_index ?
-                            (uint8_t)thumb_read_mem(app->cpu, p->rx_index, 1) :
-                            0xFFu;
-        uint8_t screen = p->ui_screen ?
-                             (uint8_t)thumb_read_mem(app->cpu, p->ui_screen, 1) :
-                             0xFFu;
-        uint8_t ui_mode = p->ui_mode ?
-                              (uint8_t)thumb_read_mem(app->cpu, p->ui_mode, 1) :
-                              0xFFu;
-        uint8_t ui_cursor = p->ui_cursor ?
-                                (uint8_t)thumb_read_mem(app->cpu, p->ui_cursor, 1) :
-                                0xFFu;
         uint16_t gray[4] = {0, 0, 0, 0};
         int min_x = OLED_VISIBLE_COLS, min_y = OLED_PAGES * 4;
         int max_x = -1, max_y = -1;
@@ -1097,19 +983,10 @@ static void oled_commit(AppState* app) {
             }
         }
         FURI_LOG_I(TAG,
-                   "RX OLED commit #%lu fb=0x%08lX nonzero=%u gray=%u/%u/%u/%u "
-                   "bbox=%d,%d-%d,%d result[c/d/e]=%u/%u/%u ui=%u/%u/%u",
-                   (unsigned long)app->oled_frames, (unsigned long)p->fb_addr,
-                   (unsigned)nonzero,
+                   "RX OLED commit #%lu nonzero=%u gray=%u/%u/%u/%u bbox=%d,%d-%d,%d",
+                   (unsigned long)app->oled_frames, (unsigned)nonzero,
                    (unsigned)gray[0], (unsigned)gray[1], (unsigned)gray[2],
-                   (unsigned)gray[3], min_x, min_y, max_x, max_y, brand, valid,
-                   index, screen, ui_mode, ui_cursor);
-        if(app->rx_drawn_text_len) {
-            app->rx_drawn_text[app->rx_drawn_text_len] = '\0';
-            FURI_LOG_I(TAG, "RX draw_char trace: \"%s\" (%u chars)",
-                       app->rx_drawn_text, app->rx_drawn_text_len);
-            app->rx_drawn_text_len = 0;
-        }
+                   (unsigned)gray[3], min_x, min_y, max_x, max_y);
     }
 }
 
@@ -1240,21 +1117,28 @@ static void spi_byte(AppState* app, uint8_t b) {
     }
 }
 
-/* Mirror the keyfob indicator LED (profile led_port/led_pin) onto the Flipper's
- * red LED. Called after every GPIO DOUT write on that port, reading the FINAL
- * pin state (so DOUTSET/DOUTCLR/DOUT are all handled uniformly). We only touch
- * the HAL on a real change (led_on cache) to avoid spamming furi_hal_light_set in
- * the firmware's fast blink loop. The first toggle is logged (throttled). */
+/* Keyfob indicator LED pin. This is PHYSICAL HARDWARE (GPIO port3=D pin14, bit
+ * 0x4000; confirmed by the RE: "DOUT(port3) ^= 0x4000 ; blink LED"), identical
+ * for every firmware of this keyfob -- so it is a HW constant, NOT a per-firmware
+ * profile field. Agnostic. */
+#define KEYFOB_LED_PORT 3u
+#define KEYFOB_LED_PIN 14u
+
+/* Mirror the keyfob indicator LED (HW pin port3/pin14) onto the Flipper's red
+ * LED. Called after every GPIO DOUT write on that port, reading the FINAL pin
+ * state (so DOUTSET/DOUTCLR/DOUT are all handled uniformly). We only touch the
+ * HAL on a real change (led_on cache) to avoid spamming furi_hal_light_set in the
+ * firmware's fast blink loop. The first toggle is logged (throttled). */
 static void led_mirror(AppState* app, uint32_t port) {
-    if(port != app->prof->led_port) return;
-    bool on = (app->gpio_dout[port] >> app->prof->led_pin) & 1u;
+    if(port != KEYFOB_LED_PORT) return;
+    bool on = (app->gpio_dout[port] >> KEYFOB_LED_PIN) & 1u;
     if(on == app->led_on) return;
     app->led_on = on;
     furi_hal_light_set(LightRed, on ? 0xFF : 0x00);
     if(!app->led_logged) {
         app->led_logged = true;
         FURI_LOG_D(TAG, "LED: port%u pin%u -> %s (first toggle; subsequent are silent)",
-                   (unsigned)app->prof->led_port, (unsigned)app->prof->led_pin,
+                   (unsigned)KEYFOB_LED_PORT, (unsigned)KEYFOB_LED_PIN,
                    on ? "ON" : "OFF");
     }
 }
@@ -1267,7 +1151,7 @@ static void led_mirror(AppState* app, uint32_t port) {
  * non-blockingly by the hot loop). pin_prev/pin_now are the OLD/NEW pin levels. */
 static bool buzz_pin_is_reserved(AppState* app, uint32_t port, uint32_t pin) {
     const ArmProfile* p = app->prof;
-    if(port == p->led_port && pin == p->led_pin) return true; /* LED */
+    if(port == KEYFOB_LED_PORT && pin == KEYFOB_LED_PIN) return true; /* LED */
     if(port == OLED_DC_PORT && pin == OLED_DC_PIN) return true; /* OLED DC (A9) */
     if(port == p->data_port && pin == p->data_pin) return true; /* Si4432 RX-data (PB0) */
     /* RF control pins are NOT a buzzer (they toggle during radio activity):
@@ -1416,15 +1300,43 @@ static void mmio_write(void* ctx, uint32_t addr, uint32_t val, int size) {
                            (unsigned long)sub);
             }
         }
+    } else if(addr == 0xE000ED08u) {
+        /* SCB->VTOR: the firmware installs its active vector table base at
+         * runtime (flash-XIP 0x8100 for both known fw, or RAM). Store it so
+         * cur_vtor()/the NVIC dispatch honour the DYNAMIC table. The PPB has no
+         * backing memory in the core, so we keep it here. Agnostic: we honour
+         * whatever the firmware writes (ported from the ESP32 port). */
+        app->ppb_vtor = val;
+    } else if(addr == 0xE000E100u) {
+        /* NVIC ISER0 (set-enable, IRQ0..31): writing 1 ENABLES IRQ N. Track the
+         * live enabled mask so the scheduler only fires IRQs the firmware really
+         * wants. Ported from pandora_tui.py _on_ppb_write / the ESP32 port. */
+        app->nvic_enabled |= (uint64_t)(val & 0xFFFFFFFFu);
+    } else if(addr == 0xE000E104u) {
+        /* NVIC ISER1 (set-enable, IRQ32..63): this MCU uses up to ~IRQ36. */
+        app->nvic_enabled |= (uint64_t)(val & 0xFFFFFFFFu) << 32;
+    } else if(addr == 0xE000E180u) {
+        /* NVIC ICER0 (clear-enable, IRQ0..31): writing 1 DISABLES IRQ N. */
+        app->nvic_enabled &= ~((uint64_t)(val & 0xFFFFFFFFu));
+    } else if(addr == 0xE000E184u) {
+        /* NVIC ICER1 (clear-enable, IRQ32..63). */
+        app->nvic_enabled &= ~((uint64_t)(val & 0xFFFFFFFFu) << 32);
     }
     (void)size;
 }
 
-/* ------------------------------------------------------------ minimal NVIC */
+/* ------------------------------------------------------------ AGNOSTIC NVIC --
+ *
+ * Driven by the firmware's REAL ISER/ICER (nvic_enabled) and dynamic VTOR
+ * (ppb_vtor). The old port had bugs: it round-robined {12,13,14,1} blindly, read
+ * VTOR via a callback that returned 0 (so IRQs rarely fired), and hardcoded the
+ * default-handler address 0x82DB. All fixed here, matching the ESP32 port and
+ * pandora_tui.py. */
 
-/* Current VTOR (SCB->VTOR at 0xE000ED08). We read it via the core (callback). */
+/* Current VTOR: the firmware installs it at runtime; stored in ppb_vtor (the PPB
+ * has no backing memory in the core). Agnostic. */
 static uint32_t cur_vtor(AppState* app) {
-    return thumb_read_mem(app->cpu, 0xE000ED08u, 4);
+    return app->ppb_vtor;
 }
 
 static uint32_t irq_handler_addr(AppState* app, int irqn) {
@@ -1433,225 +1345,250 @@ static uint32_t irq_handler_addr(AppState* app, int irqn) {
     return thumb_read_mem(app->cpu, off, 4);
 }
 
-/* Timer IRQs that we fire periodically (from the RE: IRQ12/13/14 timers,
- * IRQ1 system). IRQ numbers (not exception numbers). */
-static const int TIMER_IRQS[] = {12, 13, 14, 1};
+/* EFM32 Gecko TIMER IRQ lines (TIMER0..2 = IRQ12/13/14). These are IRQ NUMBERS
+ * (indices into the VTOR-pointed vector table), NOT firmware code addresses. The
+ * UI refresh tick of both firmwares is IRQ13 (TIMER2). IRQ1 is intentionally
+ * EXCLUDED now (firing an always-on helper on every tick floods the fw when it
+ * masks IRQ13 in a critical section -> pmax UI livelock). Same as the ESP32 port
+ * and the Python core. */
+static const int TIMER_IRQS[] = {12, 13, 14};
 
+/* Try to enter the exception for IRQ 'irqn'. Returns true if it actually entered
+ * a VALID handler. Rejects: empty/0 vectors, handlers outside flash/RAM, and the
+ * default/weak handler (a `b .` self-branch, opcode 0xE7FE) -- all detected
+ * GENERICALLY (no firmware address hardcoded; the old 0x82DB hardcode is gone).
+ * Ported from the ESP32 try_enter_irq / pandora_tui.py _enter_irq. */
+static bool try_enter_irq(AppState* app, int irqn) {
+    uint32_t handler = irq_handler_addr(app, irqn);
+    uint32_t h = handler & ~1u;
+    bool in_flash = (h < PA_FLASH_BASE + app->fc.flash_used);
+    bool in_ram = (h >= PA_RAM_BASE && h < PA_RAM_BASE + PA_RAM_SIZE);
+    if(!handler || !(in_flash || in_ram)) return false;
+    /* skip a branch-to-self default handler (infinite loop) */
+    uint16_t op = (uint16_t)thumb_read_mem(app->cpu, h, 2);
+    if(op == 0xE7FEu) return false;
+    app->tick_count++;
+    app->in_irq = 1;
+    thumb_enter_exception(app->cpu, handler, THUMB_EXC_RETURN_MSP_THREAD,
+                          (uint32_t)(irqn + 16));
+    app->next_pc = thumb_get_reg(app->cpu, 15);
+    return true;
+}
+
+/* Fire the NEXT valid TIMER IRQ the firmware has ENABLED now in the real ISER.
+ * Walk TIMER_IRQS round-robin, skipping IRQs not enabled in nvic_enabled and
+ * ones try_enter_irq rejects. If none is valid this tick (fw masked the timers
+ * in a critical section) fire NOTHING (no hang, no flood). If the fw has not
+ * written any ISER yet (mask==0, very early boot) don't filter by ISER and let
+ * try_enter_irq judge. Ported from the ESP32 nvic_tick / _irq_scheduler_tick. */
 static void nvic_tick(AppState* app) {
     if(app->in_irq) return;
     uint32_t vtor = cur_vtor(app);
-    if(vtor < 0x8000u) return; /* the app has not installed its table yet */
-    int irqn = TIMER_IRQS[app->irq_rr % (int)(sizeof(TIMER_IRQS) / sizeof(int))];
-    app->irq_rr++;
-    uint32_t handler = irq_handler_addr(app, irqn);
-    if(handler == 0 || handler == 0x82DBu) return; /* default handler: skip */
-    app->tick_count++;
-    app->in_irq = 1;
-    thumb_enter_exception(app->cpu, handler, THUMB_EXC_RETURN_MSP_THREAD, (uint32_t)(irqn + 16));
-    app->next_pc = thumb_get_reg(app->cpu, 15);
+    if(vtor < 0x8000u) return; /* table not installed yet (pre-app) */
+    int n = (int)(sizeof(TIMER_IRQS) / sizeof(TIMER_IRQS[0]));
+    uint64_t mask = app->nvic_enabled;
+    bool use_mask = (mask != 0);
+    for(int k = 0; k < n; k++) {
+        int irqn = TIMER_IRQS[app->irq_rr % n];
+        app->irq_rr++;
+        if(use_mask && !(mask & ((uint64_t)1u << irqn))) continue; /* not enabled now */
+        if(try_enter_irq(app, irqn)) return;
+    }
+    /* no valid slot this tick */
 }
 
-/* Locates a WFI instruction (0xBF30) in the app code to detect sleep. Scan each
- * cached page as a byte array instead of calling fc_read() for every halfword;
- * this avoids tens of thousands of cache/LRU operations during launch. */
-static uint32_t find_wfi(FlashCache* fc) {
+/* ------------------------------------------------------------ WFI scan ------
+ * AGNOSTIC: scan the whole code space for WFI(0xBF30)/WFE(0xBF20). Flash is
+ * scanned from 0x40 (past the initial vector table, so vector data is not
+ * mistaken for opcodes) -- NOT the old hardcoded 0x8100. RAM is rescanned once
+ * after boot (app-in-RAM loaders). The addresses are kept in a growable set for
+ * membership tests. Ported from the ESP32 find_wfi / _find_wfi. */
+static void wfi_add(AppState* app, uint32_t addr) {
+    if(app->wfi_count >= app->wfi_cap) {
+        uint32_t ncap = app->wfi_cap ? app->wfi_cap * 2u : 64u;
+        uint32_t* nb = (uint32_t*)realloc(app->wfi_set, ncap * sizeof(uint32_t));
+        if(!nb) return;
+        app->wfi_set = nb;
+        app->wfi_cap = ncap;
+    }
+    app->wfi_set[app->wfi_count++] = addr;
+}
+
+static bool wfi_contains(AppState* app, uint32_t addr) {
+    for(uint32_t i = 0; i < app->wfi_count; i++)
+        if(app->wfi_set[i] == addr) return true;
+    return false;
+}
+
+static void scan_wfi_buf(AppState* app, const uint8_t* buf, uint32_t base,
+                         uint32_t len, uint32_t start) {
+    for(uint32_t off = start; off + 1u < len; off += 2) {
+        uint16_t hw = (uint16_t)(buf[off] | (buf[off + 1] << 8));
+        if(hw == 0xBF30u || hw == 0xBF20u) wfi_add(app, base + off);
+    }
+}
+
+/* Scan flash for WFI/WFE from 0x40. Streams each 4KB page from the paged cache
+ * as a byte array (no per-halfword fc_read -> no LRU thrash at launch). */
+static void find_wfi(AppState* app) {
+    FlashCache* fc = &app->fc;
+    app->wfi_count = 0;
     uint32_t size = fc->flash_used;
     uint32_t lim = size < 0x20000u ? size : 0x20000u;
     for(uint32_t page_base = 0; page_base < lim; page_base += FLASH_PAGE_SIZE) {
         uint32_t page_end = page_base + FLASH_PAGE_SIZE;
         if(page_end > lim) page_end = lim;
-        uint32_t first = page_base < 0x8100u ? 0x8100u : page_base;
+        uint32_t first = page_base < 0x40u ? 0x40u : page_base;
         if(first >= page_end) continue;
         const uint8_t* page = fc_page_ptr(fc, page_base / FLASH_PAGE_SIZE);
+        if(!page) continue;
         uint32_t off = first - page_base;
         if(off & 1u) off++;
-        for(; off + 1 < page_end - page_base; off += 2) {
-            if(page[off] == 0x30u && page[off + 1] == 0xBFu)
-                return page_base + off;
+        for(; off + 1u < page_end - page_base; off += 2) {
+            uint16_t hw = (uint16_t)(page[off] | (page[off + 1] << 8));
+            if(hw == 0xBF30u || hw == 0xBF20u) wfi_add(app, page_base + off);
         }
     }
-    return 0xFFFFFFFFu;
+    app->wfi_pc_hint = app->wfi_count ? app->wfi_set[0] : 0xFFFFFFFFu;
+    app->wfi_ram_scanned = 0;
 }
 
-/* ------------------------------------------------------------ knock FSM */
-
-/* Called by the per-instruction hook. Injects the knock-code synchronized with
- * the scanner: presses at scan_head, releases after N spins (confirms on
- * release). Replica of _knock_step from pandora_tui.py. */
-static void knock_step(AppState* app, uint32_t a) {
-    if(!app->knock_active) return;
-    if(app->knock_sub == 0 && a == app->prof->scan_head) {
-        if(app->knock_idx < app->knock_len) {
-            app->knock_cur = app->knock_seq[app->knock_idx];
-            set_button(app, app->knock_cur, true);
-            app->knock_sub = 1;
-            app->knock_spins = 0;
-        } else {
-            app->knock_active = 0;
-        }
-    } else if(app->knock_sub == 1) {
-        for(int i = 0; i < app->prof->spin_count; i++) {
-            if(a == app->prof->spin_heads[i]) {
-                app->knock_spins++;
-                if(app->knock_spins >= KNOCK_RELEASE_AFTER) {
-                    set_button(app, app->knock_cur, false);
-                    app->knock_idx++;
-                    app->knock_sub = 0;
-                }
-                break;
-            }
-        }
-    }
+static void rescan_wfi_ram(AppState* app) {
+    /* RAM holds the app (and its WFI) when a loader copied code there. */
+    scan_wfi_buf(app, app->ram, PA_RAM_BASE, PA_RAM_SIZE, 0u);
 }
 
-/* Called by the per-instruction hook. POST-unlock navigation injection,
- * synchronized with the profile's nav_reader. Faithful port of _nav_hook (the
- * closure inside nav_button) in pandora_tui.py:
- *   - the nav_reader (read_gpio_pin inlined) is SHARED: the firmware runs it
- *     once per button and per UI-loop turn with r0=port, r1=pin.
- *   - phase "press": on the FIRST reader read (ANY pin), press our pin (0) so
- *     the button's handler sees it pressed on its next turn.
- *   - phase "hold":  count ONLY the reader re-reads of OUR pin (r0==port &&
- *     r1==pin). After nav_reads_target re-reads, release the pin -> the handler
- *     dispatches (short click, or long press if target == NAV_LONG_READS).
- * The pin counting on r0/r1 is the reliability fix from NAV_DIAG.md: counting
- * reads of any pin lost presses. */
-static void nav_step(AppState* app, uint32_t a) {
-    if(!app->nav_active) return;
-    if(a != app->prof->nav_reader) return;
-    uint32_t r0 = thumb_get_reg(app->cpu, 0); /* port */
-    uint32_t r1 = thumb_get_reg(app->cpu, 1); /* pin */
-    bool is_our_pin = (r0 == app->nav_port && r1 == app->nav_pin);
-    if(app->nav_phase == 0) { /* press */
-        app->gpio_din[app->nav_port] &= (uint16_t)~(1u << app->nav_pin); /* 0 = pressed */
-        app->btn_pressed[app->nav_btn] = 1;
-        app->nav_phase = 1;
-        app->nav_reads = 0;
-    } else if(app->nav_phase == 1) { /* hold */
-        if(is_our_pin) {
-            app->nav_reads++;
-            if(app->nav_reads >= app->nav_reads_target) {
-                app->gpio_din[app->nav_port] |= (uint16_t)(1u << app->nav_pin); /* release */
-                app->btn_pressed[app->nav_btn] = 0;
-                app->nav_phase = 2; /* done */
-            }
-        }
-    }
+/* ------------------------------------------------------------ unlock signal -
+ * AGNOSTIC: a locked keyfob shows a BLACK screen; once unlocked the firmware
+ * draws its UI. We derive 'unlocked' from the OBSERVABLE framebuffer having lit
+ * pixels, NOT from a firmware code address (the old code hooked unlock_pc).
+ * Ported from the ESP32 emu_is_unlocked / pandora_tui.py @property unlocked. */
+static bool emu_is_unlocked(AppState* app) {
+    for(int i = 0; i < OLED_FB_SIZE; i++)
+        if(app->oled_fb[i]) return true;
+    return false;
 }
 
-/* Per-instruction hook: counts, detects unlock_pc, advances the knock FSM
- * (pre-unlock) OR the nav FSM (post-unlock). The core only exposes ONE hook
- * (thumb_set_hook); both FSMs share this single code_hook, exactly like the
- * reference emulator shares one UC_HOOK_CODE. Only one of the two is ever
- * active at a time. */
+/* Per-instruction hook: counts, keeps PC, and performs the AGNOSTIC WFI skip.
+ * The old hook also detected unlock by pc==unlock_pc and advanced the knock/nav
+ * PC-sync FSMs -- all REMOVED (unlock is now observable via the framebuffer, and
+ * knock/nav are pure-GPIO presses with no PC-sync). If the firmware parks in a
+ * WFI/WFE, step over it so the foreground polling loop keeps spinning and the
+ * NVIC tick can advance. Detected by membership in the scanned set (no
+ * per-firmware address). Ported from the ESP32 code_hook / _on_code. */
 static void code_hook(void* ctx, uint32_t pc) {
     AppState* app = (AppState*)ctx;
     app->ninsn = emu_insn_now(app);
     app->pc = pc;
-    if(app->rx_addr_trace_left) {
-        app->rx_addr_trace_left--;
-        /* Pandora D605 RE: central RX dispatch @0xD16C, fixed-code handler
-         * for ID 14 @0xD7BA, draw_char @0xA060 (character in r2). */
-        if(pc == 0xD16Cu && !app->rx_addr_trace_handler_seen) {
-            app->rx_addr_trace_handler_seen = 1;
-            FURI_LOG_I(TAG,
-                       "RX addr trace handler @D16C id=%u mode=%u pending=%u",
-                       (unsigned)thumb_read_mem(app->cpu, 0x200005C1u, 1),
-                       (unsigned)thumb_read_mem(app->cpu, 0x200005BCu, 1),
-                       (unsigned)thumb_read_mem(app->cpu, 0x200005C0u, 1));
-        }
-        if(pc == 0xD7BAu) {
-            FURI_LOG_I(TAG, "RX addr trace LandRover fixed handler @D7BA");
-        }
-        if(pc == 0xA060u) {
-            uint32_t ch = thumb_get_reg(app->cpu, 2);
-            if(app->rx_drawn_text_len < sizeof(app->rx_drawn_text) - 1u) {
-                app->rx_drawn_text[app->rx_drawn_text_len++] =
-                    (ch >= 0x20u && ch <= 0x7Eu) ? (char)ch : '?';
-            }
-        }
+    if(app->wfi_count && wfi_contains(app, pc & ~1u)) {
+        /* advance PC past the 16-bit WFI/WFE so the core does not re-park. */
+        thumb_set_reg(app->cpu, 15, (pc & ~1u) + 2u + 1u);
     }
-    if(!app->unlocked && pc == app->prof->unlock_pc) {
-        app->unlocked = 1;
-    }
-    if(app->knock_active) knock_step(app, pc);
-    if(app->nav_active) nav_step(app, pc);
 }
 
-/* ------------------------------------------------------------ execution */
+/* ------------------------------------------------------------ execution ----
+ *
+ * FUSION of the Flipper fast-path with the AGNOSTIC ISER scheduler.
+ *
+ * The Flipper improvement (preserved) is the HOOKLESS fast-path: once unlocked
+ * and with no PC-sync FSM active, the core runs its own tight thumb_run() loop
+ * instead of crossing back into this wrapper per instruction. The old code ran
+ * ONE nvic_tick at the TOP of the call and then let thumb_run(count) run the
+ * WHOLE budget uninterrupted -- so with 6000-insn callers the IRQ13 UI tick
+ * fired at the caller's cadence, but a single large call (auto_unlock uses
+ * 50k-100k) diluted the tick ~N-fold and the firmware's button scanner missed
+ * injected key edges (UI stayed black). This is the exact bug the ESP32 port
+ * fixed by SUBDIVIDING.
+ *
+ * FUSION: we subdivide the budget into RUN_SUBBURST chunks and interleave the
+ * nvic_tick BETWEEN chunks (so IRQ13 keeps its cadence regardless of the caller
+ * burst size), while keeping the hookless fast-path INSIDE each chunk. The slow
+ * instruction-at-a-time path (with EXC_RETURN detection) is used only while an
+ * IRQ is in flight or the hook is needed (pre-unlock boot). Ported from the
+ * ESP32 emu_run_burst + the Python run_burst. */
+#define RUN_SUBBURST 15000u
 
-/* A burst of instructions with WFI/tick + EXC_RETURN handling. Replica of
- * run_burst from pandora_tui.py. */
 static void run_burst(AppState* app, uint32_t count) {
     ThumbCore* cpu = app->cpu;
     ThumbHook saved_hook = cpu->hook;
     void* saved_hook_ctx = cpu->hook_ctx;
-    bool skip_hook = app->unlocked && !app->nav_active && !app->knock_active &&
-                     !app->rx_addr_trace_left;
-    uint64_t now_insn = emu_insn_now(app);
-    bool app_running = cur_vtor(app) >= 0x8000u;
-    bool stuck_wfi = app_running && (app->next_pc & ~1u) == (app->wfi_pc_hint & ~1u);
-    bool want_tick = app_running &&
-                     (stuck_wfi || (now_insn - app->last_tick_insn) > 20000ull);
-    if(want_tick && !app->in_irq) {
-        app->last_tick_insn = now_insn;
-        nvic_tick(app);
-    }
-    if(skip_hook) thumb_set_hook(cpu, NULL, NULL);
-    thumb_set_reg(cpu, 15, app->next_pc);
-    /* In steady state there is no PC-synchronised button injection, and with
-     * no active exception there cannot be an EXC_RETURN to intercept. Let the
-     * core run its own tight loop instead of crossing back into this wrapper
-     * after every instruction just to read PC and test the exception prefix.
-     * Keep the instruction-at-a-time path for navigation/knock hooks and IRQs. */
-    if(skip_hook && !app->in_irq) {
-        (void)thumb_run(cpu, count);
-        /* skip_hook is only temporary: nav_button/auto_unlock rely on this
-         * callback being present when they activate their PC-synchronised FSM. */
-        thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
-        app->next_pc = cpu->r[15];
+
+    uint32_t remaining = count;
+    int guard = 0;
+    while(remaining > 0 && guard < 1024) {
+        guard++;
+        bool app_running = cur_vtor(app) >= 0x8000u;
+        /* Once the app is running, rescan RAM ONCE for WFI/WFE in case a loader
+         * copied the app (and its WFI) to SRAM (app-in-RAM, e.g. pmax). */
+        if(app_running && !app->wfi_ram_scanned) {
+            rescan_wfi_ram(app);
+            app->wfi_ram_scanned = 1;
+        }
+        /* INTERLEAVED TICK: fire the NVIC tick when stuck in a WFI or at the
+         * periodic RUN_SUBBURST cadence, BEFORE running the next chunk. This is
+         * what keeps IRQ13 (the UI tick) from being diluted inside a big call. */
+        bool stuck_wfi =
+            app_running && app->wfi_count && wfi_contains(app, app->next_pc & ~1u);
+        uint64_t now_insn = emu_insn_now(app);
+        bool periodic = (now_insn - app->last_tick_insn) > RUN_SUBBURST;
+        if(app_running && !app->in_irq && (stuck_wfi || periodic)) {
+            app->last_tick_insn = now_insn;
+            nvic_tick(app);
+        }
+
+        uint32_t step = remaining < RUN_SUBBURST ? remaining : RUN_SUBBURST;
+        uint64_t before = emu_insn_now(app);
+
+        /* The hookless fast-path is valid only in steady state (unlocked, no IRQ
+         * in flight). Otherwise the per-instruction hook (WFI skip) and the
+         * EXC_RETURN detection are both required. */
+        bool skip_hook = app->unlocked && !app->in_irq;
+        thumb_set_reg(cpu, 15, app->next_pc);
+        if(skip_hook) {
+            thumb_set_hook(cpu, NULL, NULL);
+            (void)thumb_run(cpu, step);
+            thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
+            app->next_pc = cpu->r[15];
+        } else {
+            for(uint32_t i = 0; i < step; i++) {
+                int rc = thumb_step(cpu);
+                if(rc < 0) break;
+                uint32_t pc = thumb_get_reg(cpu, 15);
+                if((pc & 0xFFFFFFF0u) == 0xFFFFFFF0u) { /* EXC_RETURN */
+                    thumb_exc_return(cpu, pc);
+                    app->in_irq = 0;
+                    break;
+                }
+            }
+            app->next_pc = thumb_get_reg(cpu, 15);
+        }
         app->ninsn = emu_insn_now(app);
         app->pc = app->next_pc & ~1u;
-        return;
+
+        uint64_t consumed = app->ninsn - before;
+        uint32_t dec = consumed > 0 ? (consumed < remaining ? (uint32_t)consumed : remaining) : 1u;
+        remaining -= dec;
     }
-    for(uint32_t i = 0; i < count; i++) {
-        int rc = thumb_step(cpu);
-        if(rc < 0) break;
-        uint32_t pc = thumb_get_reg(cpu, 15);
-        /* EXC_RETURN: the ISR finished (bx lr with 0xFFFFFFFx) */
-        if((pc & 0xFFFFFFF0u) == 0xFFFFFFF0u) {
-            thumb_exc_return(cpu, pc);
-            app->in_irq = 0;
-            app->next_pc = thumb_get_reg(cpu, 15);
-            if(skip_hook) thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
-            app->ninsn = emu_insn_now(app);
-            app->pc = app->next_pc & ~1u;
-            return;
-        }
-    }
-    app->next_pc = thumb_get_reg(cpu, 15);
-    if(skip_hook) thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
-    app->ninsn = emu_insn_now(app);
-    app->pc = app->next_pc & ~1u;
+    /* keep the observable unlock flag up to date (no code-address hook) */
+    if(!app->unlocked && emu_is_unlocked(app)) app->unlocked = 1;
 }
 
+/* Pre-unlock fallback press (rare: auto_unlock normally already ran at boot).
+ * AGNOSTIC: a single short button press purely over GPIO, no scanner PC-sync. */
 static void tap(AppState* app, int btn) {
-    /* buffer in the struct itself for the 1-step tap */
-    static uint8_t one[1];
-    one[0] = (uint8_t)btn;
-    app->knock_seq = one;
-    app->knock_len = 1;
-    app->knock_idx = 0;
-    app->knock_sub = 0;
-    app->knock_cur = 0;
-    app->knock_active = 1;
+    if(btn < 0 || btn >= BTN_COUNT) return;
+    set_button(app, btn, true);
     uint64_t done = 0;
-    while(app->knock_active && done < 4000000ull) {
-        run_burst(app, 40000);
-        done += 40000;
-        if(app->knock_idx >= app->knock_len) app->knock_active = 0;
+    while(done < 300000ull) {
+        run_burst(app, 50000);
+        done += 50000;
     }
-    app->knock_active = 0;
+    set_button(app, btn, false);
+    done = 0;
+    while(done < 300000ull) {
+        run_burst(app, 50000);
+        done += 50000;
+    }
 }
 
 /* Cheap hash of the keyfob framebuffer (92x16=1472B), used by nav_button's
@@ -1668,149 +1605,134 @@ static uint32_t fb_hash(AppState* app) {
     return h;
 }
 
-/* Injects ONE navigation button POST-unlock and lets the UI advance. Faithful
- * port of nav_button() in pandora_tui.py.
- *
- * Unlike the knock (pre-unlock scanner tap()), the post-unlock UI uses a main
- * loop that calls each button handler one-by-one; each handler reads its pin
- * once via the SHARED nav_reader (r0=port, r1=pin) and, if it sees it pressed,
- * enters a hold loop re-reading the pin, dispatching on release and
- * distinguishing short click vs long press by how many re-reads the hold
- * lasted.
- *
- *   1) arm the nav FSM; on the first nav_reader read we PRESS the pin (sync).
- *   2) hold for nav_reads_target re-reads OF OUR PIN (hold_reads short /
- *      long_reads for a long press).
- *   3) release -> the handler dispatches.
- *
- * Then an ADAPTIVE settle: run short bursts and STOP as soon as the framebuffer
- * changes (UI redrew) past a minimum, so feedback is ~0.2s instead of ~1s.
- *
- * Returns true if the injection completed (press+hold+release). */
+/* --- AGNOSTIC button/knock timing (pure HARDWARE order-of-magnitude, insn as a
+ * proxy for time; NOT a per-firmware code address). Mirrors the ESP32 port and
+ * pandora_tui.py press_button / auto_unlock durations. --- */
+#define BTN_PRESS_INSN 300000ull   /* short click: pin held low ~this long */
+#define BTN_HOLD_INSN 1200000ull   /* long press (above the long-press window) */
+#define BTN_SETTLE_INSN 500000ull  /* settle after release (adaptive early-out) */
+#define BTN_BURST 50000u
+
+#define KNOCK_BOOT_SETTLE_INSN 1200000ull /* boot settle before the knock */
+#define KNOCK_CLICK_INSN 150000ull        /* short knock click (brief pulses) */
+#define KNOCK_CLICK_SETTLE_INSN 200000ull
+#define KNOCK_GATE_HOLD_INSN 900000ull
+#define KNOCK_GATE_SETTLE_INSN 400000ull
+#define KNOCK_FINAL_SETTLE_INSN 2000000ull
+
+/* Press+release ONE button POST-unlock PURELY over GPIO with realistic timing,
+ * exactly like the hardware / the ESP32 emu_press_button / pandora_tui.py
+ * press_button. Drive the DIN pin low (pressed), run the firmware a while (its
+ * own polling scan -- powered by the faithful TIMERs + agnostic NVIC -- sees the
+ * pin), then drive it high (released). The firmware distinguishes short click vs
+ * long press by the TIME the pin was low, like a real finger. AGNOSTIC: no
+ * PC/code-address sync (no scan_head/nav_reader). The adaptive settle
+ * (improvement 7) is preserved: run short bursts and STOP as soon as the
+ * committed framebuffer changes, for ~0.2s feedback instead of ~1s. */
 static bool nav_button(AppState* app, int btn, bool hold) {
     if(btn < 0 || btn >= BTN_COUNT) return false;
     FURI_LOG_D(TAG, "nav_button: btn=%d hold=%d unlocked=%d", btn, hold, app->unlocked);
-    uint8_t port, pin;
-    btn_port_pin(app->prof, btn, &port, &pin);
-    app->nav_btn = (uint8_t)btn;
-    app->nav_port = port;
-    app->nav_pin = pin;
-    app->nav_phase = 0; /* press */
-    app->nav_reads = 0;
-    app->nav_reads_target = hold ? NAV_LONG_READS : NAV_HOLD_READS;
-    app->nav_active = 1;
+    uint64_t down_insn = hold ? BTN_HOLD_INSN : BTN_PRESS_INSN;
 
-    /* The press loop exits as soon as the firmware dispatches the release.
-     * Small slices bound overshoot without changing the number of GPIO reads
-     * used to represent a short or long press. */
+    /* 1) press (pin low) */
+    set_button(app, btn, true);
     uint64_t done = 0;
-    while(app->nav_phase != 2 && done < NAV_BUDGET_INSN) {
-        run_burst(app, NAV_PRESS_BURST);
-        done += NAV_PRESS_BURST;
+    while(done < down_insn) {
+        run_burst(app, BTN_BURST);
+        done += BTN_BURST;
     }
-    app->nav_active = 0;
-    /* guarantee release (in case the budget ran out mid-hold) */
-    app->gpio_din[port] |= (uint16_t)(1u << pin);
-    app->btn_pressed[btn] = 0;
+    /* 2) release (pin high) -> firmware dispatches the action on the edge */
+    set_button(app, btn, false);
 
-    bool completed = (app->nav_phase == 2);
-
-    /* Check the committed screen often and stop close to the first completed
-     * redraw instead of running another large instruction chunk. */
+    /* 3) adaptive settle: run until the UI redraws (fb changes), bounded. */
     uint32_t prev = fb_hash(app);
     done = 0;
     bool redrew = false;
-    while(done < NAV_SETTLE_INSN) {
-        run_burst(app, NAV_SETTLE_BURST);
-        done += NAV_SETTLE_BURST;
+    while(done < BTN_SETTLE_INSN) {
+        run_burst(app, 60000u);
+        done += 60000u;
         uint32_t cur = fb_hash(app);
-        if(cur != prev && done >= NAV_SETTLE_MIN_INSN) { redrew = true; break; } /* UI redrew */
+        if(cur != prev && done >= 120000u) { redrew = true; break; } /* redrew: early-out */
         prev = cur;
     }
-    if(app->prof->ui_screen) {
-        uint8_t screen = (uint8_t)thumb_read_mem(app->cpu, app->prof->ui_screen, 1);
-        uint8_t mode = (uint8_t)thumb_read_mem(app->cpu, app->prof->ui_mode, 1);
-        uint8_t cursor = (uint8_t)thumb_read_mem(app->cpu, app->prof->ui_cursor, 1);
-        uint8_t brand = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
-        FURI_LOG_D(TAG,
-                   "nav_button: done btn=%d completed=%d redrew=%d settle_insn=%llu screen=%u mode=%u cursor=%u brand=%u",
-                   btn, completed, redrew, (unsigned long long)done, screen, mode,
-                   cursor, brand);
-    } else {
-        FURI_LOG_D(TAG, "nav_button: done btn=%d completed=%d redrew=%d settle_insn=%llu",
-                   btn, completed, redrew, (unsigned long long)done);
-    }
-    return completed;
+    FURI_LOG_D(TAG, "nav_button: done btn=%d redrew=%d settle_insn=%llu",
+               btn, redrew, (unsigned long long)done);
+    return true;
 }
 
+/* AGNOSTIC auto-unlock: press the knock-code PURELY over GPIO as an autotest
+ * (knock = FIRMWARE CONFIG, supplied by the host/UI, NOT baked into the agnostic
+ * core). Mirrors the ESP32 auto_unlock / pandora_tui.py: settle the boot with
+ * FINE bursts (so the keyboard scanner reaches a phase where it samples every
+ * port, incl. the B5 gate port), press the sequence with brief clicks, then hold
+ * the gate. 'unlocked' is the OBSERVABLE display signal (framebuffer has lit
+ * pixels), NOT a code address. Returns true if the display drew content. */
 static bool auto_unlock(AppState* app) {
     uint32_t phase_tick = furi_get_tick();
     FURI_LOG_I(TAG, "boot: starting MCU execution/unlock sequence");
     app->unlocked = 0;
     app->max_step = -1;
-    /* 1) settle until the scanner is active (valid window) */
+
+    /* Resolve the knock sequence: the user sequence from the UI takes priority;
+     * otherwise a model default (firmware config, not hardware). knock_seq /
+     * knock_len / knock_gate are set by the caller (emu_reset_and_unlock). */
+    const uint8_t* seq = app->knock_seq;
+    uint8_t len = app->knock_len;
+    int gate = app->knock_gate;
+
+    /* 1) settle the boot with FINE bursts so the scanner samples every port */
     uint64_t done = 0;
-    while(done < KNOCK_SETTLE_INSN) {
-        run_burst(app, 100000);
-        done += 100000;
+    while(done < KNOCK_BOOT_SETTLE_INSN) {
+        run_burst(app, 20000u);
+        done += 20000u;
     }
     FURI_LOG_I(TAG, "boot: scan loop reached (%lu ms, insn=%llu)",
                (unsigned long)(furi_get_tick() - phase_tick),
                (unsigned long long)app->ninsn);
-    /* 2) inject the full sequence synchronized with the scanner.
-     * Prefer the sequence ENTERED by the user in the menu; if none was defined,
-     * use the default of the detected profile. */
-    if(app->knock_user_len > 0) {
-        app->knock_seq = app->knock_user;
-        app->knock_len = app->knock_user_len;
-        FURI_LOG_I(TAG, "knock: using user sequence (len=%u)", app->knock_user_len);
-    } else {
-        app->knock_seq = app->prof->knock;
-        app->knock_len = app->prof->knock_len;
-        FURI_LOG_I(TAG, "knock: using default of profile %s (len=%u)",
-                   app->prof->name, app->prof->knock_len);
+
+    if(len == 0) {
+        /* no knock configured: just report the observable after the settle. */
+        app->unlocked = emu_is_unlocked(app) ? 1 : 0;
+        FURI_LOG_I(TAG, "boot: no knock configured -> unlocked=%d (observable)",
+                   app->unlocked);
+        return app->unlocked != 0;
     }
-    app->knock_idx = 0;
-    app->knock_sub = 0;
-    app->knock_cur = 0;
-    app->knock_active = 1;
-    uint64_t budget = KNOCK_STEP_BUDGET * (app->knock_len ? app->knock_len : 1);
+
+    /* 2) press the knock sequence as short clicks (brief pulses), pure GPIO */
+    for(uint8_t i = 0; i < len; i++) {
+        int btn = seq[i];
+        if(btn < 0 || btn >= BTN_COUNT) continue;
+        set_button(app, btn, true);
+        uint64_t d = 0;
+        while(d < KNOCK_CLICK_INSN) { run_burst(app, 20000u); d += 20000u; }
+        set_button(app, btn, false);
+        d = 0;
+        while(d < KNOCK_CLICK_SETTLE_INSN) { run_burst(app, 20000u); d += 20000u; }
+    }
+    FURI_LOG_I(TAG, "boot: knock sequence injected (len=%u, insn=%llu)", len,
+               (unsigned long long)app->ninsn);
+
+    /* 3) final gate: hold it */
+    if(gate >= 0 && gate < BTN_COUNT) {
+        set_button(app, gate, true);
+        done = 0;
+        while(done < KNOCK_GATE_HOLD_INSN) { run_burst(app, 50000u); done += 50000u; }
+        set_button(app, gate, false);
+        done = 0;
+        while(done < KNOCK_GATE_SETTLE_INSN) { run_burst(app, 50000u); done += 50000u; }
+    }
+
+    /* 4) final settle: let the firmware finish unlocking + draw the UI */
     done = 0;
-    while(app->knock_active && !app->unlocked && done < budget) {
-        run_burst(app, 40000);
-        done += 40000;
-        if(app->knock_idx >= app->knock_len) app->knock_active = 0;
+    while(done < KNOCK_FINAL_SETTLE_INSN && !emu_is_unlocked(app)) {
+        run_burst(app, 100000u);
+        done += 100000u;
     }
-    FURI_LOG_I(TAG, "boot: knock sequence %s (%lu ms, insn=%llu)",
-               app->unlocked ? "accepted" : "injected",
+    app->unlocked = emu_is_unlocked(app) ? 1 : 0;
+    FURI_LOG_I(TAG, "boot: unlock %s (%lu ms, insn=%llu, observable)",
+               app->unlocked ? "OK" : "FAILED",
                (unsigned long)(furi_get_tick() - phase_tick),
                (unsigned long long)app->ninsn);
-    app->knock_active = 0;
-    /* 3) final gate: hold B5 for a while */
-    set_button(app, app->prof->gate, true);
-    done = 0;
-    while(done < 600000) {
-        run_burst(app, 50000);
-        done += 50000;
-    }
-    set_button(app, app->prof->gate, false);
-    FURI_LOG_I(TAG, "boot: gate hold complete (%lu ms)",
-               (unsigned long)(furi_get_tick() - phase_tick));
-    /* 4) let it run so the app redraws the UI (with ticks) */
-    done = 0;
-    while(done < 600000) {
-        run_burst(app, 100000);
-        done += 100000;
-    }
-    FURI_LOG_I(TAG, "boot: initial UI settled (%lu ms, insn=%llu)",
-               (unsigned long)(furi_get_tick() - phase_tick),
-               (unsigned long long)app->ninsn);
-    if(app->unlocked) {
-        FURI_LOG_I(TAG, "unlock OK (knock-code accepted, PC unlock=0x%06lX)",
-                   (unsigned long)app->prof->unlock_pc);
-    } else {
-        FURI_LOG_W(TAG, "unlock FAILED (knock-code incomplete / not accepted)");
-    }
     return app->unlocked != 0;
 }
 
@@ -1926,7 +1848,7 @@ static int hexbyte(const char* s) {
  * Updates *ext_lin. Returns 1 if it was EOF, 0 if next, -1 on error. The temp
  * file is pre-filled with 0xFF, so records can arrive out of order safely. */
 static int ihex_line(const char* ln, size_t len, File* out, uint32_t flash_size,
-                     uint32_t* ext_lin) {
+                     uint32_t* ext_lin, uint32_t* highest) {
     if(len < 10) return 0; /* line too short: ignore (stray CR/LF) */
     int count = hexbyte(ln);
     int ah = hexbyte(ln + 2);
@@ -1950,6 +1872,9 @@ static int ihex_line(const char* ln, size_t len, File* out, uint32_t flash_size,
         if(n > 0) {
             if(!storage_file_seek(out, base, true)) return -1;
             if(storage_file_write(out, buf, (size_t)n) != (size_t)n) return -1;
+            /* AGNOSTIC: track the highest written address (effective flash size,
+             * like the Python core's `top = max(code)+1`). */
+            if(highest && base + (uint32_t)n > *highest) *highest = base + (uint32_t)n;
         }
     } else if(rtype == 0x01) { /* EOF */
         return 1;
@@ -1990,7 +1915,12 @@ static bool fill_file_ff(File* out, uint32_t size) {
  * This is done ONCE at load; the flash cache then pages 4KB blocks from the flat
  * file, never re-parsing Intel HEX. Robust and format-agnostic. */
 static LoadResult flatten_firmware(AppState* app, Storage* storage, const char* path) {
-    const uint32_t flash_size = app->prof->flash_used;
+    /* AGNOSTIC: the flat image spans the whole physical flash WINDOW (264KB).
+     * The EFFECTIVE flash_used is derived below from the firmware image itself
+     * (file size for a .bin, highest written address for a .hex) and rounded up
+     * to a 4KB page, NOT a per-firmware constant. */
+    const uint32_t flash_size = PA_FLASH_SIZE;
+    uint32_t effective = 0; /* highest byte offset written + 1 */
     File* f = storage_file_alloc(storage);
     File* out = storage_file_alloc(storage);
     LoadResult res = LoadIoError;
@@ -2037,7 +1967,8 @@ static LoadResult flatten_firmware(AppState* app, Storage* storage, const char* 
                         linepos = 0; /* start of record */
                     } else if(ch == '\n' || ch == '\r') {
                         if(linepos > 0) {
-                            int r = ihex_line(line, linepos, out, flash_size, &ext_lin);
+                            int r = ihex_line(line, linepos, out, flash_size,
+                                              &ext_lin, &effective);
                             if(r < 0) { err = true; break; }
                             if(r == 1) { eof_rec = true; break; }
                             linepos = 0;
@@ -2064,7 +1995,15 @@ static LoadResult flatten_firmware(AppState* app, Storage* storage, const char* 
                 off += (uint32_t)n;
             }
             if(werr) break;
+            effective = off; /* flat .bin: the whole file is the firmware */
         }
+        /* AGNOSTIC flash_used: page-align the effective size up to 4KB and clamp
+         * to the window; fall back to the window if nothing was written. Mirrors
+         * the ESP32 emu_init sizing (page-align + margin). */
+        if(effective == 0) effective = flash_size;
+        effective = (effective + FLASH_PAGE_SIZE - 1u) & ~(FLASH_PAGE_SIZE - 1u);
+        if(effective > flash_size) effective = flash_size;
+        app->flash_used = effective;
         res = LoadOk;
     } while(false);
     if(out_open) storage_file_close(out);
@@ -2095,7 +2034,7 @@ static bool fc_read_page(FlashCache* fc, uint32_t page, uint8_t* dst) {
  * init (rom_load slot loop). */
 static LoadResult fc_init(AppState* app) {
     FlashCache* fc = &app->fc;
-    fc->flash_used = app->prof->flash_used;
+    fc->flash_used = app->flash_used; /* AGNOSTIC: derived at load, not per-fw */
     fc->num_pages = (fc->flash_used + FLASH_PAGE_SIZE - 1) / FLASH_PAGE_SIZE;
     fc->use_counter = 0;
     fc->miss_count = 0;
@@ -2269,14 +2208,13 @@ static uint32_t fc_read(FlashCache* fc, uint32_t addr, int size) {
     return v;
 }
 
+/* AGNOSTIC: there is only ONE hardware profile now. The SAME profile runs ANY
+ * .hex for this MCU, so we always return PROFILE_PANDORA_HW regardless of the
+ * firmware (the knock-code, which IS firmware-specific, is handled separately
+ * as a GPIO autotest, not by the profile). (void)path keeps the signature. */
 static const ArmProfile* pick_profile(const char* path) {
-    if(path) {
-        if(strstr(path, "MAX") || strstr(path, "max") || strstr(path, "PANDORA_MAX"))
-            return &PROFILE_PANDORAMAX;
-        if(strstr(path, "2_5253") || strstr(path, "pandora"))
-            return &PROFILE_PANDORA;
-    }
-    return &PROFILE_PANDORA;
+    (void)path;
+    return &PROFILE_PANDORA_HW;
 }
 
 /* ------------------------------------------------------------ CC1101 RF */
@@ -2497,14 +2435,9 @@ static void rf_follow_apply_mode(AppState* app, int new_mode) {
      * RX -> inject into PB0 (demod ISR); TX -> capture PB3 edges and replay. */
     switch(new_mode) {
     case 2: /* RX */
-        /* Direct/bit-bang RX via the firmware SW demodulator ISR. Requires a
-         * known demod ISR (both profiles set rf_sw_demod=true). */
-        if(!app->prof->rf_sw_demod) {
-            FURI_LOG_W(TAG, "RF: firmware rf_rx_on but SW-demod RX not available on %s "
-                            "(direct mode, no demod ISR mapped)",
-                       app->prof->name);
-            break;
-        }
+        /* AGNOSTIC: direct/bit-bang RX by injecting edges on PB0 + TIMER1. Every
+         * firmware of this keyfob uses direct mode, so RX is always available
+         * (no per-firmware rf_sw_demod / demod-ISR address). */
         app->rf_mode = RfModeRx;
         if(!app->rx_running) {
             rf_reapply_preset(app); /* match modulation before RX */
@@ -2823,255 +2756,44 @@ static void rx_rssi_update(AppState* app) {
     }
 }
 
-/* Executes a firmware subroutine (addr) as call() does in arm_pandora.py:
- * scratch SP, LR=sentinel, runs until returning to the sentinel. Leaves the
- * core state (PC/SP/LR) restored for the main loop. */
-#define ARM_CALL_SENTINEL 0x001FFFF0u
-#define ARM_CALL_SCRATCH_SP 0x20007000u
-
-/* RX's majority filter needs several consecutive calls at each captured
- * level. Keep every real ISR invocation, but save/restore the emulated main
- * context and instruction hook once per edge instead of once per sample. */
-static void call_rx_demod_samples(AppState* app, uint8_t repetitions) {
-    ThumbCore* cpu = app->cpu;
-    const uint32_t addr = app->prof->demod_isr;
-    uint32_t s_pc = app->next_pc;
-    uint32_t s_sp = thumb_get_reg(cpu, 13);
-    uint32_t s_lr = thumb_get_reg(cpu, 14);
-    uint32_t s_r0 = thumb_get_reg(cpu, 0);
-    uint32_t s_r1 = thumb_get_reg(cpu, 1);
-    uint8_t s_halted = cpu->halted;
-    ThumbHook s_hook = cpu->hook;
-    void* s_hook_ctx = cpu->hook_ctx;
-    bool count_without_hook = app->unlocked && !app->nav_active && !app->knock_active;
-    if(count_without_hook) thumb_set_hook(cpu, NULL, NULL);
-
-    uint32_t pending_off = app->prof->rx_pending - PA_RAM_BASE;
-    for(uint8_t call = 0; call < repetitions; call++) {
-        thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
-        thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
-        thumb_set_reg(cpu, 15, addr | 1u);
-        cpu->halted = 0;
-        bool returned = false;
-        for(uint32_t i = 0; i < 200000u; i++) {
-            if((cpu->r[15] & ~1u) == (ARM_CALL_SENTINEL & ~1u)) {
-                returned = true;
-                break;
-            }
-            if(thumb_step(cpu) < 0) break;
-        }
-        /* call_subroutine restores these caller-saved registers after every
-         * sample, so keep the same boundary between repeated ISR calls. */
-        thumb_set_reg(cpu, 0, s_r0);
-        thumb_set_reg(cpu, 1, s_r1);
-        cpu->halted = s_halted;
-        if(!returned) break;
-        if(pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF) break;
-    }
-
-    if(count_without_hook) {
-        app->ninsn = emu_insn_now(app);
-        app->pc = thumb_get_reg(cpu, 15) & ~1u;
-    }
-    thumb_set_hook(cpu, s_hook, s_hook_ctx);
-    thumb_set_reg(cpu, 0, s_r0);
-    thumb_set_reg(cpu, 1, s_r1);
-    thumb_set_reg(cpu, 13, s_sp);
-    thumb_set_reg(cpu, 14, s_lr);
-    cpu->halted = s_halted;
-    thumb_set_reg(cpu, 15, s_pc);
-    app->next_pc = s_pc;
-}
-
-static void rx_wr8(AppState* app, uint32_t addr, uint8_t v) {
-    thumb_write_mem(app->cpu, addr, v, 1);
-}
-
-/* Prepare transient receiver state while preserving firmware-owned UI/decoder
- * state. Pandora's RX struct shares its first 0x40 bytes with live UI fields
- * (screen at +0x37, mode at +0x38), so never clear that whole prefix. */
-static void rx_prime(AppState* app, bool init_level) {
+/* ------------------------------------------------------------ RX injection --
+ *
+ * AGNOSTIC RX injection, ported from the ESP32 emu_rx_inject_edge and
+ * pandora_tui.py's hardware-faithful RF path. The edge is presented on the REAL
+ * RX-data pin (PB0 = data_port.data_pin) and the pulse WIDTH is written to
+ * TIMER1's capture CNT (rx_pulse_ticks), which the firmware's own demod reads
+ * via TIMER1_CNT (mmio_read returns rx_pulse_ticks while rx_feeding). We DO NOT
+ * call the firmware's demod ISR by address, and we DO NOT poke any profile RAM
+ * offset (the old call_rx_demod_samples / rx_feed_spooled_edge / rx_prime did
+ * both). The firmware detects/processes the edge through its OWN GPIO/EXTI +
+ * TIMER1-capture path, driven by the agnostic NVIC scheduler (TIMER1 = IRQ12),
+ * exactly like real hardware. Agnostic for ANY firmware -- and this is what
+ * removes the ~20 per-firmware RX RAM addresses.
+ *
+ * duration_us -> CNT ticks: the Python core keeps ~6 ticks/us (HFPERCLK/presc
+ * proxy); we mirror that. The level is held on PB0 until the next edge. A few
+ * foreground bursts let the firmware poll/service the edge before returning. */
+static void emu_rx_inject_edge(AppState* app, bool level, uint32_t duration_us) {
     const ArmProfile* p = app->prof;
-    uint8_t lvl = init_level ? 1 : 0;
-    /* Set only the receiver's live control bytes; do not clear a RAM prefix. */
-    rx_wr8(app, p->rx_gate, 1); /* active receiver gate (!=0xFF) */
-    rx_wr8(app, p->rx_pending, 0); /* data present (!=0xFF) */
-    if(p->rx_reset_state) rx_wr8(app, p->rx_state, 0);
-    if(p->rx_filter_taps) {
-        /* Clear only the mapped receiver filter/history bytes, including its
-         * filtered-level and edge-marker fields. Do not touch UI state at +0x37. */
-        for(uint32_t o = 0x10u; o < 0x1Cu; o++) rx_wr8(app, p->rx_struct + o, lvl);
-    }
-    rx_wr8(app, p->rx_struct + 9, lvl);
-    rx_wr8(app, p->rx_struct + 0xA, lvl);
-    rx_wr8(app, p->rx_carrier_gate, lvl);
-    /* DATA pin (DIN port B bit0) at the idle level */
-    if(init_level)
-        app->gpio_din[p->data_port] |= (uint16_t)(1u << p->data_pin);
-    else
-        app->gpio_din[p->data_port] &= (uint16_t)~(1u << p->data_pin);
-    app->rx_prev_level = init_level;
-    app->rx_primed = true;
-}
+    uint8_t port = p->data_port, pin = p->data_pin;
 
-/* Snapshot the protocol handler's result before the next frame is injected.
- * This distinguishes a pulse-decoder hit from an upper-layer/UI accept. */
-static void rx_log_firmware_accept(AppState* app, uint8_t id) {
-    const ArmProfile* p = app->prof;
-    uint8_t result[16];
-    uint8_t status[8];
-    char hex[sizeof(result) * 2 + 1];
-    char status_hex[sizeof(status) * 2 + 1];
-    for(size_t i = 0; i < sizeof(result); i++) {
-        /* run_burst may already have consumed and cleared the firmware's
-         * result buffer. Report the immutable pulse-decoder snapshot here. */
-        result[i] = i < sizeof(app->rx_last_frame) ? app->rx_last_frame[i] : 0;
-        snprintf(hex + i * 2, sizeof(hex) - i * 2, "%02X", result[i]);
-    }
-    /* Pmax's decoder/UI handoff lives after the first 16 raw bytes:
-     * result+0x1F is validated and +0x20 is the brand/family selector. */
-    for(size_t i = 0; i < sizeof(status); i++) {
-        status[i] = p->ui_screen ?
-                        (uint8_t)thumb_read_mem(
-                            app->cpu, p->rx_result + 0x1Fu + (uint32_t)i, 1) :
-                        0xFFu;
-        snprintf(status_hex + i * 2, sizeof(status_hex) - i * 2, "%02X", status[i]);
-    }
-    uint8_t decoder = (uint8_t)thumb_read_mem(app->cpu, p->rx_mode, 1);
-    uint8_t pending = (uint8_t)thumb_read_mem(app->cpu, p->rx_pending, 1);
-    uint32_t visible_hash = fb_hash(app);
-    if(p->rx_valid && p->rx_brand) {
-        uint8_t valid = (uint8_t)thumb_read_mem(app->cpu, p->rx_valid, 1);
-        uint8_t brand = (uint8_t)thumb_read_mem(app->cpu, p->rx_brand, 1);
-        uint8_t index = p->rx_index ?
-                            (uint8_t)thumb_read_mem(app->cpu, p->rx_index, 1) :
-                            0xFFu;
-        if(p->ui_screen) {
-            uint8_t screen = (uint8_t)thumb_read_mem(app->cpu, p->ui_screen, 1);
-            uint8_t mode = (uint8_t)thumb_read_mem(app->cpu, p->ui_mode, 1);
-            uint8_t cursor = p->ui_cursor ?
-                                 (uint8_t)thumb_read_mem(app->cpu, p->ui_cursor, 1) :
-                                 0xFFu;
-            FURI_LOG_I(
-                TAG,
-                "RX handler returned id=%u dec=%u pending=%02X ui=%u/%u/%u "
-                "post[c/d/e]=%u/%u/%u meta=%s captured16=%s fbhash=%08lX",
-                id, decoder, pending, screen, mode, cursor, brand, valid, index,
-                status_hex, hex, (unsigned long)visible_hash);
-        } else {
-            FURI_LOG_I(TAG,
-                       "RX handler returned id=%u dec=%u pending=%02X post[c/d/e]=%u/%u/%u "
-                       "meta=%s captured16=%s fbhash=%08lX",
-                       id, decoder, pending, brand, valid, index, status_hex, hex,
-                       (unsigned long)visible_hash);
-        }
-    } else {
-        FURI_LOG_I(TAG, "RX handler returned id=%u dec=%u pending=%02X meta=%s captured16=%s fbhash=%08lX",
-                   id, decoder, pending, status_hex, hex, (unsigned long)visible_hash);
-    }
-}
-
-/* Inject one captured half-period into the demodulator. The firmware's 5-tap
- * filter must settle through repeated real ISR calls; pre-seeding the history
- * suppresses frames on hardware captures. */
-static bool rx_feed_edge(AppState* app, bool level, uint32_t dur_us) {
-    const ArmProfile* p = app->prof;
-    app->rx_pulse_ticks = (dur_us * 6u) & 0xFFFFu;
-    /* DATA pin at the NEW level (the edge already occurred) */
+    /* present the edge on the real RX-data pin (DIN) */
     if(level)
-        app->gpio_din[p->data_port] |= (uint16_t)(1u << p->data_pin);
+        app->gpio_din[port] |= (uint16_t)(1u << pin);
     else
-        app->gpio_din[p->data_port] &= (uint16_t)~(1u << p->data_pin);
-    /* The Si4432's carrier gate follows the filtered data level. */
-    rx_wr8(app, p->rx_carrier_gate, level ? 1u : 0u);
+        app->gpio_din[port] &= (uint16_t)~(1u << pin);
 
+    /* set TIMER1 capture CNT = pulse width (the demod reads TIMER1_CNT) */
+    app->rx_pulse_ticks = (duration_us * 6u) & 0xFFFFu;
     app->rx_feeding = true;
-    /* Hold DATA and TIMER1 width while the firmware's filter settles. */
-    uint8_t samples = p->rx_filter_taps ? p->rx_filter_taps : RX_ISR_SAMPLES_PER_EDGE;
-    call_rx_demod_samples(app, samples);
+
+    /* let the firmware's own foreground + TIMER1/GPIO IRQ path service the edge.
+     * Pure time (bursts); no PC/address sync, no ISR-by-address. */
+    for(int i = 0; i < 8; i++) run_burst(app, 20000u);
+
     app->rx_feeding = false;
     app->rx_prev_level = level;
     app->rx_injected++;
-
-    uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
-    return pending_off < PA_RAM_SIZE && app->ram[pending_off] == 0xFF;
-}
-
-/* Fast replay path: the SD spool already contains the clean, measured
- * half-periods. Re-run the firmware's real per-mode decoder dispatch once per
- * edge and reproduce the width-window shift from the demod ISR. This keeps the
- * decoder and frame handling firmware-owned while avoiding five complete
- * majority-filter ISR executions for every stored edge. Live capture still
- * uses rx_feed_edge() and its full hardware filter model. */
-static bool rx_feed_spooled_edge(AppState* app, bool level, uint32_t dur_us) {
-    const ArmProfile* p = app->prof;
-    ThumbCore* cpu = app->cpu;
-    if(!p->rx_decoder_dispatch || !p->rx_width_cur || !p->rx_width_prev ||
-       !p->rx_width_prev2) {
-        return rx_feed_edge(app, level, dur_us);
-    }
-
-    uint32_t pending_off = p->rx_pending - PA_RAM_BASE;
-    if(pending_off >= PA_RAM_SIZE) return false;
-
-    /* TIMER1 advances at 6 MHz and the firmware stores CNT/6 as microseconds. */
-    uint32_t width_us = ((dur_us * 6u) & 0xFFFFu) / 6u;
-    thumb_write_mem(cpu, p->rx_width_cur, width_us, 4);
-    rx_wr8(app, p->rx_carrier_gate, level ? 1u : 0u);
-    if(level)
-        app->gpio_din[p->data_port] |= (uint16_t)(1u << p->data_pin);
-    else
-        app->gpio_din[p->data_port] &= (uint16_t)~(1u << p->data_pin);
-
-    uint32_t saved_regs[16];
-    memcpy(saved_regs, cpu->r, sizeof(saved_regs));
-    uint32_t saved_xpsr = cpu->xpsr;
-    uint8_t saved_it_cond = cpu->it_cond;
-    uint8_t saved_it_mask = cpu->it_mask;
-    uint8_t saved_halted = cpu->halted;
-    ThumbHook saved_hook = cpu->hook;
-    void* saved_hook_ctx = cpu->hook_ctx;
-    uint32_t saved_next_pc = app->next_pc;
-    bool count_without_hook = app->unlocked && !app->nav_active && !app->knock_active;
-    if(count_without_hook) thumb_set_hook(cpu, NULL, NULL);
-
-    /* The demod ISR enters the dispatcher with r4 pointing at the GPIO/RX
-     * context and r5 at the firmware's state block. */
-    thumb_set_reg(cpu, 4, p->rx_struct);
-    thumb_set_reg(cpu, 5, p->rx_state_base);
-    thumb_set_reg(cpu, 13, ARM_CALL_SCRATCH_SP);
-    thumb_set_reg(cpu, 14, ARM_CALL_SENTINEL | 1u);
-    thumb_set_reg(cpu, 15, p->rx_decoder_dispatch | 1u);
-    cpu->halted = 0;
-    bool returned = false;
-    for(uint32_t i = 0; i < 200000u; i++) {
-        if((cpu->r[15] & ~1u) == (ARM_CALL_SENTINEL & ~1u)) {
-            returned = true;
-            break;
-        }
-        if(thumb_step(cpu) < 0) break;
-    }
-
-    /* The dispatcher itself does not shift the three-width window; the ISR
-     * epilogue does so after decoding each measured edge. */
-    uint32_t prev = (uint32_t)thumb_read_mem(cpu, p->rx_width_prev, 4);
-    thumb_write_mem(cpu, p->rx_width_prev2, prev, 4);
-    thumb_write_mem(cpu, p->rx_width_prev, width_us, 4);
-
-    if(count_without_hook) {
-        app->ninsn = emu_insn_now(app);
-        app->pc = cpu->r[15] & ~1u;
-    }
-    thumb_set_hook(cpu, saved_hook, saved_hook_ctx);
-    memcpy(cpu->r, saved_regs, sizeof(saved_regs));
-    cpu->xpsr = saved_xpsr;
-    cpu->it_cond = saved_it_cond;
-    cpu->it_mask = saved_it_mask;
-    cpu->halted = saved_halted;
-    app->next_pc = saved_next_pc;
-    app->rx_prev_level = level;
-    app->rx_injected++;
-    return returned && app->ram[pending_off] == 0xFF;
 }
 
 static void rx_preroll_push(AppState* app, const RxEdge* edge) {
@@ -3258,24 +2980,19 @@ static void rx_spool_start_playback(AppState* app) {
     app->rx_spool_player = best;
     FURI_LOG_I(TAG, "RX spool playback start slot=%c edges=%lu",
                (char)('A' + best), (unsigned long)(s->bytes / sizeof(RxEdge)));
-    FURI_LOG_I(TAG,
-               "RX replay path: clean widths -> firmware decoder dispatch @0x%06lX (filter bypass)",
-               (unsigned long)app->prof->rx_decoder_dispatch);
+    FURI_LOG_I(TAG, "RX replay path: clean widths -> inject on PB0 + TIMER1 "
+                    "(AGNOSTIC; firmware's own GPIO/EXTI decoder)");
 }
 
 static void rx_spool_play_pump(AppState* app) {
     /* A new capture owns the shared buffer until its writer is closed. */
     if(app->rx_spool_writer >= 0) return;
-    /* A completed demod frame is consumed by the firmware's foreground RX
-     * loop. Give run_burst() a chance to handle rx_pending before clearing the
-     * RX state for the next frame. While it remains pending, hold playback;
-     * capture/spooling continues independently in rx_bridge_pump(). */
+    /* AGNOSTIC: a decoded frame is consumed by the firmware's own foreground RX
+     * loop (we no longer poke a profile rx_pending RAM byte). Give run_burst() a
+     * brief chance to redraw the UI before feeding the next frame; capture /
+     * spooling continues independently in rx_bridge_pump(). */
     if(app->rx_reprime_pending) {
-        uint8_t pending = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_pending, 1);
-        if(pending == 0xFF) return;
-        uint8_t id = app->rx_last_frame_id;
-        rx_log_firmware_accept(app, id);
-        rx_prime(app, app->rx_prev_level);
+        run_burst(app, 40000u);
         app->rx_reprime_pending = false;
     }
 
@@ -3287,11 +3004,9 @@ static void rx_spool_play_pump(AppState* app) {
         int8_t idx = app->rx_spool_player;
         storage_file_close(s->file);
         if(storage_common_remove(app->storage, s->path) == FSE_OK) {
-            uint8_t pending = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_pending, 1);
-            uint8_t decoder = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
             FURI_LOG_I(TAG,
-                       "RX spool playback complete slot=%c; SD file deleted, decoder pending=0x%02X state=%u",
-                       (char)('A' + idx), pending, decoder);
+                       "RX spool playback complete slot=%c; SD file deleted",
+                       (char)('A' + idx));
             app->rx_spool_replayed++;
             s->state = RxSpoolFree;
         } else {
@@ -3308,7 +3023,6 @@ static void rx_spool_play_pump(AppState* app) {
     if(app->rx_spool_play_index == app->rx_spool_play_count) {
         uint32_t count = remain < RX_SPOOL_BATCH ? remain : RX_SPOOL_BATCH;
         size_t nbytes = (size_t)count * sizeof(RxEdge);
-        bool first_chunk = s->play_pos == 0;
         size_t got = storage_file_read(s->file, app->rx_spool_buffer, nbytes);
         if(got != nbytes) {
             int8_t idx = app->rx_spool_player;
@@ -3325,12 +3039,10 @@ static void rx_spool_play_pump(AppState* app) {
         s->play_pos += (uint32_t)got;
         app->rx_spool_play_count = (uint16_t)count;
         app->rx_spool_play_index = 0;
-        if(first_chunk) {
-            /* HAL callback levels describe the pulse that just ended. Seed the
-             * emulated DATA pin at that pulse's level before replaying its
-             * duration and the following transition. */
-            rx_prime(app, app->rx_spool_buffer[0].level != 0);
-        }
+        /* AGNOSTIC: seed PB0 at the first edge's level before replaying; the
+         * firmware's own GPIO/EXTI path samples it (no rx_prime RAM seeding). */
+        if(app->rx_spool_player >= 0)
+            emu_rx_inject_edge(app, app->rx_spool_buffer[0].level != 0, 1u);
     }
     uint16_t delivered = 0;
     while(app->rx_spool_play_index < app->rx_spool_play_count &&
@@ -3346,77 +3058,44 @@ static void rx_spool_play_pump(AppState* app) {
 }
 
 static bool rx_deliver_edge(AppState* app, const RxEdge* edge) {
-    /* FuriHalSubGhzCaptureCallback reports true on a falling edge after the
-     * high pulse, and false on a rising edge after the low pulse. The firmware
-     * ISR needs the post-edge DATA level, so feed the opposite level. */
-    bool done = rx_feed_spooled_edge(app, edge->level == 0, edge->duration);
-    if(!done) return false;
+    /* AGNOSTIC: inject the edge over the REAL RX-data pin (PB0) + TIMER1 CNT.
+     * FuriHalSubGhzCaptureCallback reports true on a falling edge after the high
+     * pulse, false on a rising edge after the low pulse; the firmware samples the
+     * post-edge DATA level, so feed the opposite level. We do NOT call the demod
+     * ISR by address and do NOT read/write any profile RX RAM byte -- the
+     * firmware processes the edge via its own GPIO/EXTI + TIMER1 path. A decoded
+     * frame is OBSERVABLE through the OLED redrawing (fb_hash change below). */
+    uint32_t prev_hash = fb_hash(app);
+    emu_rx_inject_edge(app, edge->level == 0, edge->duration);
 
-    app->rx_frames++;
-    uint8_t id = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_state, 1);
-    uint8_t frame[16];
-    char line[64];
-    int off = 0;
-    for(int i = 0; i < (int)sizeof(frame); i++) {
-        frame[i] = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_result + (uint32_t)i, 1);
-        int w = snprintf(line + off, sizeof(line) - (size_t)off, "%02X", frame[i]);
-        if(w < 0 || (size_t)(off + w) >= sizeof(line)) break;
-        off += w;
-    }
-    if(!app->rx_last_frame_valid || id != app->rx_last_frame_id ||
-       memcmp(frame, app->rx_last_frame, sizeof(app->rx_last_frame)) != 0) {
-        if(app->prof->rx_valid && app->prof->rx_brand &&
-           !app->prof->rx_metadata_after_handler) {
-            uint8_t valid = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_valid, 1);
-            uint8_t brand = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_brand, 1);
-            FURI_LOG_I(TAG,
-                       "RX frame #%lu decoded id=%u valid=%u brand=%u raw16=%s",
-                       (unsigned long)app->rx_frames, id, valid, brand, line);
-        } else {
-            FURI_LOG_I(TAG, "RX frame #%lu decoded id=%u raw16=%s",
-                       (unsigned long)app->rx_frames, id, line);
+    /* observe whether the firmware redrew the screen (frame accepted) */
+    bool redrew = (fb_hash(app) != prev_hash);
+    if(redrew) {
+        app->rx_frames++;
+        if(!app->rx_last_frame_valid) {
+            FURI_LOG_I(TAG, "RX frame #%lu observed (OLED redrew)",
+                       (unsigned long)app->rx_frames);
         }
-        memcpy(app->rx_last_frame, frame, sizeof(app->rx_last_frame));
-        app->rx_last_frame_id = id;
         app->rx_last_frame_valid = true;
+        app->rx_reprime_pending = true;
+        return true; /* break the replay slice so the UI can settle */
     }
-    /* Keep the firmware's frame-ready flag and result buffer intact until its
-     * foreground loop has consumed them on the next run_burst(). */
-    app->rx_last_frame_id = id;
-    app->rx_reprime_pending = true;
-    if(app->prof == &PROFILE_PANDORA && !app->rx_addr_trace_done) {
-        app->rx_addr_trace_left = 30000u;
-        app->rx_drawn_text_len = 0;
-        app->rx_addr_trace_handler_seen = 0;
-        app->rx_addr_trace_done = true;
-    }
-    return true;
+    return false;
 }
 
 static void rx_bridge_start(AppState* app) {
     if(app->rx_running || !app->radio_on) return;
-    if(!app->prof->rf_sw_demod) {
-        FURI_LOG_W(TAG, "RX bridge not available on profile %s (Si4432 FIFO/HW)",
-                   app->prof->name);
-        return;
-    }
+    /* AGNOSTIC: every firmware of this keyfob uses the Si4432 in DIRECT mode
+     * (bit-bang OOK/FSK). The emulator injects RX edges over PB0 + TIMER1, so RX
+     * is always available -- no per-firmware rf_sw_demod flag. */
     if(app->tx_active) {
         furi_hal_subghz_stop_async_tx();
         app->tx_active = false;
     }
     furi_hal_subghz_idle();
-    /* A valid frame can make the firmware briefly switch READY->RX while its
-     * foreground handler updates protocol/UI state. Preserve that frame until
-     * the foreground clears rx_pending; ordinary RX entry still primes fresh. */
-    bool frame_pending = app->rx_reprime_pending &&
-                         ((uint8_t)thumb_read_mem(app->cpu, app->prof->rx_pending, 1) ==
-                          0xFF);
-    if(!frame_pending) {
-        if(app->rx_reprime_pending)
-            rx_log_firmware_accept(app, app->rx_last_frame_id);
-        rx_prime(app, false);
-        app->rx_reprime_pending = false;
-    }
+    /* AGNOSTIC: no rx_prime RAM seeding; the DATA pin idles high (released) and
+     * the firmware's own GPIO/EXTI path samples the injected edges. */
+    app->rx_reprime_pending = false;
     app->rx_last_frame_valid = false;
     app->rx_preroll_count = 0;
     app->rx_preroll_head = 0;
@@ -3434,20 +3113,14 @@ static void rx_bridge_start(AppState* app) {
     app->rx_noise_floor_dbm = -105.0f;
     app->rx_gate_open_dbm = RX_RSSI_MIN_OPEN_DBM;
     __atomic_store_n(&app->rx_gate_open_isr, 0u, __ATOMIC_RELEASE);
-    uint8_t decoder_mode = (uint8_t)thumb_read_mem(app->cpu, app->prof->rx_mode, 1);
     uint32_t queued = __atomic_load_n(&app->rx_head, __ATOMIC_ACQUIRE) -
                       __atomic_load_n(&app->rx_tail, __ATOMIC_ACQUIRE);
     furi_hal_subghz_start_async_rx(radio_rx_callback, app);
     app->rx_running = true;
-    uint8_t isr_calls = app->prof->rx_filter_taps ? app->prof->rx_filter_taps :
-                                                    RX_ISR_SAMPLES_PER_EDGE;
     FURI_LOG_I(TAG,
-               "RX bridge ON (ISR 0x%06lX, DATA B%u.%u, decoder=%u ready=0x%06lX filter_taps=%u calls/edge=%u queued=%lu, RSSI gate)",
-               (unsigned long)app->prof->demod_isr, app->prof->data_port,
-               app->prof->data_pin, decoder_mode,
-               (unsigned long)app->prof->rx_pending,
-               app->prof->rx_filter_taps ? app->prof->rx_filter_taps : RX_ISR_SAMPLES_PER_EDGE,
-               isr_calls, (unsigned long)queued);
+               "RX bridge ON (AGNOSTIC: inject edges on PB0=B%u.%u + TIMER1, "
+               "queued=%lu, RSSI gate)",
+               app->prof->data_port, app->prof->data_pin, (unsigned long)queued);
 }
 
 static void rx_bridge_stop(AppState* app) {
@@ -3665,13 +3338,33 @@ static const char* btn_name(uint8_t b) {
 
 /* Builds the string of the current knock sequence (profile default if the user
  * did not define any). */
+/* Resolve the DEFAULT knock-code (FIRMWARE CONFIG) from the firmware file name.
+ * Agnostic: the hardware does not carry a knock; this is only a convenience for
+ * the two known builds. Unknown firmware -> no default (the user enters it in
+ * the UI). Returns the sequence and sets *len / *gate. */
+static const uint8_t* default_knock_for_name(const char* name, uint8_t* len, int* gate) {
+    *gate = B5;
+    if(name && (strstr(name, "MAX") || strstr(name, "max"))) {
+        *len = (uint8_t)sizeof(KNOCK_PMAX);
+        return KNOCK_PMAX;
+    }
+    if(name && (strstr(name, "2_5253") || strstr(name, "pandora") ||
+                strstr(name, "PANDORA"))) {
+        *len = (uint8_t)sizeof(KNOCK_PANDORA);
+        return KNOCK_PANDORA;
+    }
+    *len = 0;
+    *gate = -1;
+    return NULL;
+}
+
 static void knock_seq_str(AppState* app, char* out, size_t n) {
     const uint8_t* seq;
     uint8_t len;
     bool is_default = (app->knock_user_len == 0);
     if(is_default) {
-        seq = app->prof ? app->prof->knock : NULL;
-        len = app->prof ? app->prof->knock_len : 0;
+        int gate;
+        seq = default_knock_for_name(app->fw_name, &len, &gate);
     } else {
         seq = app->knock_user;
         len = app->knock_user_len;
@@ -3897,11 +3590,28 @@ static void emu_reset_and_unlock(AppState* app) {
     app->last_tick_insn = 0;
     app->unlocked = 0;
     app->max_step = -1;
-    app->knock_active = 0;
-    app->nav_active = 0;
-    app->nav_phase = 0;
+    app->nvic_enabled = 0; /* agnostic: fw re-writes ISER during boot */
+    app->ppb_vtor = 0;     /* agnostic: fw installs VTOR during boot */
+    app->wfi_ram_scanned = 0;
     app->spi_phase = -1;
     app->spi_rx_head = app->spi_rx_tail = 0;
+
+    /* AGNOSTIC knock-code config (FIRMWARE CONFIG, pressed over GPIO by
+     * auto_unlock). Prefer the user sequence from the UI; else a model default
+     * resolved from the firmware name. The gate is the final held button. */
+    if(app->knock_user_len > 0) {
+        app->knock_seq = app->knock_user;
+        app->knock_len = app->knock_user_len;
+        app->knock_gate = app->prof->gate; /* B5 for this keyfob hardware */
+        FURI_LOG_I(TAG, "knock: using user sequence (len=%u)", app->knock_user_len);
+    } else {
+        int gate = B5;
+        const uint8_t* seq = default_knock_for_name(app->fw_name, &app->knock_len, &gate);
+        app->knock_seq = seq;
+        app->knock_gate = gate;
+        FURI_LOG_I(TAG, "knock: default for '%s' (len=%u gate=%d)",
+                   app->fw_name[0] ? app->fw_name : "?", app->knock_len, gate);
+    }
     /* faithful timer model init: TOP=0xFFFF, rate like the Python model
      * (TIMER0 drives delay(): rate 0xC00 -> consistent per-delay cost). */
     for(int i = 0; i < 4; i++) {
@@ -4050,10 +3760,10 @@ static void run_emulator(AppState* app, Gui* gui) {
 
     uint32_t boot_tick = furi_get_tick();
     FURI_LOG_I(TAG, "boot: locating WFI and starting %s", app->prof->name);
-    app->wfi_pc_hint = find_wfi(&app->fc);
-    FURI_LOG_I(TAG, "boot: WFI scan done (%lu ms, pc=0x%06lX)",
+    find_wfi(app); /* AGNOSTIC flash scan (from 0x40); sets wfi_set + wfi_pc_hint */
+    FURI_LOG_I(TAG, "boot: WFI scan done (%lu ms, count=%lu first=0x%06lX)",
                (unsigned long)(furi_get_tick() - boot_tick),
-               (unsigned long)app->wfi_pc_hint);
+               (unsigned long)app->wfi_count, (unsigned long)app->wfi_pc_hint);
     emu_reset_and_unlock(app);
     FURI_LOG_I(TAG, "boot OK -> PC=0x%06lX insn=%llu", (unsigned long)app->pc,
                (unsigned long long)app->ninsn);
@@ -4432,7 +4142,7 @@ int32_t pandora_arm_app(void* p) {
                 TAG, "free heap=%uK, max block=%uK, need flash=%luK + ram=%uK",
                 (unsigned)(memmgr_get_free_heap() / 1024u),
                 (unsigned)(memmgr_heap_get_max_free_block() / 1024u),
-                (unsigned long)(app->prof->flash_used / 1024u),
+                (unsigned long)(app->flash_used / 1024u),
                 (unsigned)(PA_RAM_SIZE / 1024u));
 
             /* Allocate the 32KB RAM region FIRST (single contiguous block, fits
@@ -4537,6 +4247,7 @@ int32_t pandora_arm_app(void* p) {
 
     /* --- teardown --- */
     if(app->cpu) free(app->cpu);
+    if(app->wfi_set) { free(app->wfi_set); app->wfi_set = NULL; app->wfi_count = app->wfi_cap = 0; }
     fc_deinit(&app->fc); /* free the 4KB slots + bookkeeping + close the .bin */
     /* The selected HEX/BIN remains the source of truth. This canonical flat
      * image is only a paging backing file for this app session, so remove it

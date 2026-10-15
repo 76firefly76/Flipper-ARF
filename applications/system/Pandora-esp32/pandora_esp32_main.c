@@ -79,15 +79,61 @@ typedef enum {
     UploadFailed,
 } UploadState;
 
+/* ------------------------------------------------------------ launch menu flow
+ * NEW user flow (agnostic): a small menu lets the user (1) pick the .hex, (2)
+ * build the KNOCK sequence (a list of button steps), (3) press Launch. Launch
+ * uploads the firmware (FW_BEGIN/CHUNK/END) and then sends PROTO_MSG_UNLOCK with
+ * the knock so the ESP32 auto-unlocks. If the knock is wrong the user just
+ * unlocks manually with the Flipper buttons (the firmware keeps running). */
+typedef enum {
+    PhaseLinkWait = 0, /* probing the ESP32 UART link (PING/PONG) */
+    PhaseMenu, /* the launch menu (hex / knock / launch) */
+    PhaseKnockEdit, /* the knock-sequence editor */
+    PhaseLaunching, /* uploading + unlocking */
+    PhaseRunning, /* firmware is up: render FB, forward buttons */
+} AppPhase;
+
+/* Menu rows. */
+typedef enum {
+    MenuRowHex = 0,
+    MenuRowKnock,
+    MenuRowGate,
+    MenuRowLaunch,
+    MenuRowCount,
+} MenuRow;
+
+/* Max knock steps the UI builds; must not exceed PROTO_KNOCK_MAX_STEPS. */
+#define KNOCK_MAX_STEPS PROTO_KNOCK_MAX_STEPS
+
+/* One editable knock step: a keyfob button id (PROTO_BTN_ID_*) + hold flag. */
+typedef struct {
+    uint8_t button; /* PROTO_BTN_ID_* */
+    uint8_t hold; /* 0 short, 1 long */
+} KnockStep;
+
+/* Short labels for the 6 keyfob buttons, indexed by PROTO_BTN_ID_*. */
+static const char* const KEYFOB_BTN_NAMES[6] = {"UP", "DOWN", "OK", "BACK", "B5", "B6"};
+
+/* Default knock = classic Pandora combo (UP,OK,OK,UP,UP,DOWN) + hold B5 gate. */
+static const KnockStep DEFAULT_KNOCK[] = {
+    {PROTO_BTN_ID_UP, 0}, {PROTO_BTN_ID_OK, 0}, {PROTO_BTN_ID_OK, 0},
+    {PROTO_BTN_ID_UP, 0}, {PROTO_BTN_ID_UP, 0}, {PROTO_BTN_ID_DOWN, 0},
+};
+
 /* ------------------------------------------------------------ button mapping
- * Copied VERBATIM from PandoraARM (main.c FK_* / FK_TO_BTN):
- *   Flipper UP    -> keyfob button 6 (B6)
- *   Flipper OK    -> keyfob button 5 (B5)
- *   Flipper DOWN  -> keyfob button 4 (BACK)
- *   Flipper LEFT  -> keyfob button 2 (OK)
- *   Flipper RIGHT -> keyfob button 1 (UP)
- *   Flipper BACK  -> keyfob button 3 (DOWN)
- * UP held > 1s = EXIT the app (keyfob button 6 has no long-press conflict).
+ * FINAL agnostic 1:1 mapping (matches PandoraARM_buttons_fix.md -- all 6 keyfob
+ * buttons reachable, intuitive layout):
+ *   Flipper UP    -> keyfob UP   (button 1)
+ *   Flipper OK    -> keyfob OK   (button 2)
+ *   Flipper DOWN  -> keyfob DOWN (button 3)
+ *   Flipper LEFT  -> keyfob BACK (button 4)
+ *   Flipper RIGHT -> keyfob B5   (button 5)
+ *   Flipper BACK  -> keyfob B6   (button 6)
+ *
+ * EXIT THE APP: hold Flipper BACK > 1s. A SHORT Flipper BACK is still a keyfob B6
+ * tap; the >1s window sits ABOVE the keyfob's ~500ms-1s long-press, so exit never
+ * steals a button function. UP is left free for normal keyfob use (unlike the old
+ * map where UP>1s=exit stole button 1's hold).
  *
  * The values below are the PROTO_BTN_* bits for the LOGICAL keyfob button each
  * physical Flipper key maps to. */
@@ -144,6 +190,17 @@ typedef struct {
     uint8_t ping_attempts;
     bool upload_started;
     bool fb_requested;
+
+    /* ---- launch menu + knock editor (new user flow) ---- */
+    AppPhase phase;
+    uint8_t menu_row; /* MenuRow cursor on the launch menu */
+    FuriString* hex_path; /* chosen .hex path ("" until picked) */
+    bool hex_chosen;
+    KnockStep knock[KNOCK_MAX_STEPS];
+    uint8_t knock_len;
+    uint8_t knock_gate; /* PROTO_BTN_ID_* or PROTO_BTN_ID_NONE */
+    uint8_t knock_cursor; /* editor cursor (0..knock_len; == knock_len = "add") */
+    bool launch_requested; /* set by the menu, consumed by the loop */
 } AppState;
 
 /* ------------------------------------------------------------ input events
@@ -153,12 +210,12 @@ typedef struct {
 /* Map a Flipper InputKey to the keyfob logical button bit (PROTO_BTN_*). */
 static uint8_t flipper_key_to_btn(InputKey key) {
     switch(key) {
-    case InputKeyUp: return PROTO_BTN_B6; /* Flipper UP    -> keyfob 6 (B6) */
-    case InputKeyOk: return PROTO_BTN_B5; /* Flipper OK    -> keyfob 5 (B5) */
-    case InputKeyDown: return PROTO_BTN_BACK; /* Flipper DOWN  -> keyfob 4 (BACK) */
-    case InputKeyLeft: return PROTO_BTN_OK; /* Flipper LEFT  -> keyfob 2 (OK) */
-    case InputKeyRight: return PROTO_BTN_UP; /* Flipper RIGHT -> keyfob 1 (UP) */
-    case InputKeyBack: return PROTO_BTN_DOWN; /* Flipper BACK  -> keyfob 3 (DOWN) */
+    case InputKeyUp: return PROTO_BTN_UP; /* Flipper UP    -> keyfob UP   (1) */
+    case InputKeyOk: return PROTO_BTN_OK; /* Flipper OK    -> keyfob OK   (2) */
+    case InputKeyDown: return PROTO_BTN_DOWN; /* Flipper DOWN  -> keyfob DOWN (3) */
+    case InputKeyLeft: return PROTO_BTN_BACK; /* Flipper LEFT  -> keyfob BACK (4) */
+    case InputKeyRight: return PROTO_BTN_B5; /* Flipper RIGHT -> keyfob B5   (5) */
+    case InputKeyBack: return PROTO_BTN_B6; /* Flipper BACK  -> keyfob B6   (6) */
     default: return 0;
     }
 }
@@ -190,6 +247,77 @@ static void beep_pump(AppState* app) {
     }
 }
 
+/* Basename of the chosen .hex (for the menu). Returns "<none>" if unset. */
+static const char* hex_basename(AppState* app) {
+    if(!app->hex_chosen || furi_string_empty(app->hex_path)) return "<none>";
+    const char* p = furi_string_get_cstr(app->hex_path);
+    const char* slash = strrchr(p, '/');
+    return slash ? slash + 1 : p;
+}
+
+/* ---- launch menu render: hex / knock / gate / launch ---- */
+static void draw_menu(Canvas* canvas, AppState* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "[ESP32] Pandora");
+    canvas_set_font(canvas, FontSecondary);
+
+    char line[48];
+    const int y0 = 22;
+    const int dy = 11;
+    for(int r = 0; r < MenuRowCount; r++) {
+        int y = y0 + r * dy;
+        if(r == app->menu_row) canvas_draw_str(canvas, 1, y, ">");
+        switch(r) {
+        case MenuRowHex:
+            snprintf(line, sizeof(line), "Firmware: %s", hex_basename(app));
+            break;
+        case MenuRowKnock:
+            snprintf(line, sizeof(line), "Knock: %u steps", (unsigned)app->knock_len);
+            break;
+        case MenuRowGate:
+            snprintf(line, sizeof(line), "Gate: %s",
+                     app->knock_gate == PROTO_BTN_ID_NONE ? "none" :
+                                                            KEYFOB_BTN_NAMES[app->knock_gate]);
+            break;
+        case MenuRowLaunch:
+            snprintf(line, sizeof(line), "Launch");
+            break;
+        default:
+            line[0] = 0;
+            break;
+        }
+        canvas_draw_str(canvas, 8, y, line);
+    }
+    /* trim long firmware names so they fit */
+}
+
+/* ---- knock editor render: a horizontal list of steps ---- */
+static void draw_knock_editor(Canvas* canvas, AppState* app) {
+    canvas_set_font(canvas, FontPrimary);
+    canvas_draw_str(canvas, 2, 10, "Edit knock");
+    canvas_set_font(canvas, FontSecondary);
+    canvas_draw_str(canvas, 2, 22, "L/R:move  U/D:btn  OK:hold");
+    canvas_draw_str(canvas, 2, 32, "Hold OK:add  Hold BACK:del");
+
+    char line[64];
+    /* Build the sequence string; mark the cursor. */
+    FuriString* s = furi_string_alloc();
+    for(uint8_t i = 0; i < app->knock_len; i++) {
+        const char* nm = KEYFOB_BTN_NAMES[app->knock[i].button];
+        if(i == app->knock_cursor) furi_string_cat_str(s, "[");
+        furi_string_cat_str(s, nm);
+        if(app->knock[i].hold) furi_string_cat_str(s, "*");
+        if(i == app->knock_cursor) furi_string_cat_str(s, "]");
+        furi_string_cat_str(s, " ");
+    }
+    if(app->knock_cursor >= app->knock_len) furi_string_cat_str(s, "[+]");
+    snprintf(line, sizeof(line), "%s", furi_string_get_cstr(s));
+    canvas_draw_str(canvas, 2, 46, line);
+    furi_string_free(s);
+
+    canvas_draw_str(canvas, 2, 60, "BACK: done  (* = long press)");
+}
+
 /* ------------------------------------------------------------ OLED render
  * Copied from PandoraARM render_oled: collapse the 92x16 2bpp framebuffer to
  * 1bpp (pixel on if popcount of the 2 bits >= 1), render only the 88 visible
@@ -197,6 +325,16 @@ static void beep_pump(AppState* app) {
 static void draw_callback(Canvas* canvas, void* ctx) {
     AppState* app = (AppState*)ctx;
     canvas_clear(canvas);
+
+    /* Launch menu / knock editor phases. */
+    if(app->phase == PhaseMenu) {
+        draw_menu(canvas, app);
+        return;
+    }
+    if(app->phase == PhaseKnockEdit) {
+        draw_knock_editor(canvas, app);
+        return;
+    }
 
     if(!app->fw_acked) {
         canvas_set_font(canvas, FontPrimary);
@@ -216,7 +354,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
                      (unsigned long)((app->upload_total + 1023u) / 1024u));
             break;
         case UploadWaitingAck:
-            snprintf(status, sizeof(status), "Waiting for ESP32 boot...");
+            snprintf(status, sizeof(status), "Uploading / unlocking...");
             break;
         case UploadNoLink:
             snprintf(status, sizeof(status), "ESP32 link timeout");
@@ -235,7 +373,7 @@ static void draw_callback(Canvas* canvas, void* ctx) {
         canvas_draw_str_aligned(canvas, 64, 38, AlignCenter, AlignCenter, status);
         if(app->upload_state == UploadNoLink) {
             canvas_draw_str_aligned(
-                canvas, 64, 53, AlignCenter, AlignCenter, "Hold UP to exit / retry app");
+                canvas, 64, 53, AlignCenter, AlignCenter, "Hold BACK to exit app");
         }
         return;
     }
@@ -479,27 +617,16 @@ static void update_rx_rssi_gate(AppState* app) {
 }
 
 /* ------------------------------------------------------------ firmware upload
- * Pick a .hex from the SD (file browser if needed), stream it to the ESP32. */
+ * AGNOSTIC: no profile is deduced or sent. The .hex is chosen in the menu, then
+ * streamed on Launch; the unlock knock is sent explicitly (send_unlock). */
 
-/* Deduce the FW profile from the file name. Per the protocol, profile 0 is
- * PANDORA_MAX, 1 is PANDORA. So "MAX" in the name => 0, otherwise => 1. */
-static uint8_t deduce_profile(const char* path) {
-    if(strstr(path, "MAX") || strstr(path, "max") || strstr(path, "Max")) {
-        return PROTO_FW_PROFILE_PANDORA_MAX; /* 0 */
-    }
-    return PROTO_FW_PROFILE_PANDORA; /* 1 */
-}
-
-/* Returns true if a .hex was selected + streamed. */
-static bool upload_firmware(AppState* app) {
+/* Open the SD file browser and store the chosen .hex into app->hex_path.
+ * Returns true if a file was picked. Must run on the app thread (modal). */
+static bool choose_hex_file(AppState* app) {
     FuriString* path = furi_string_alloc();
-    bool ok = false;
-
-    /* Default to the pandora firmware directory; fall back to /ext. */
-    app->upload_state = UploadChoosingFile;
-    FURI_LOG_I(TAG, "firmware picker: updating status view");
-    if(app->view_port) view_port_update(app->view_port);
-    if(storage_dir_exists(app->storage, PANDORA_FW_DIR)) {
+    if(app->hex_chosen && !furi_string_empty(app->hex_path)) {
+        furi_string_set(path, app->hex_path);
+    } else if(storage_dir_exists(app->storage, PANDORA_FW_DIR)) {
         furi_string_set(path, PANDORA_FW_DIR);
     } else {
         furi_string_set(path, "/ext");
@@ -511,26 +638,33 @@ static bool upload_firmware(AppState* app) {
     opts.hide_ext = false;
     /* The app viewport is on GuiLayerFullscreen. Leaving it attached hides
      * the modal file browser, making the app look stuck on its upload screen. */
-    FURI_LOG_I(TAG, "opening firmware file browser");
     gui_remove_view_port(app->gui, app->view_port);
     bool selected = dialog_file_browser_show(app->dialogs, path, path, &opts);
     gui_add_view_port(app->gui, app->view_port, GuiLayerFullscreen);
     view_port_update(app->view_port);
     FURI_LOG_I(TAG, "firmware file browser closed (selected=%u)", selected);
-    if(!selected) {
-        FURI_LOG_W(TAG, "no firmware selected");
+    if(selected) {
+        furi_string_set(app->hex_path, path);
+        app->hex_chosen = true;
+    }
+    furi_string_free(path);
+    return selected;
+}
+
+/* Stream app->hex_path to the ESP32 as FW_BEGIN / FW_CHUNK* / FW_END.
+ * Returns true if the whole file was streamed. */
+static bool upload_firmware(AppState* app) {
+    bool ok = false;
+    if(!app->hex_chosen || furi_string_empty(app->hex_path)) {
         app->upload_state = UploadNoFile;
-        if(app->view_port) view_port_update(app->view_port);
-        furi_string_free(path);
         return false;
     }
+    const char* cpath = furi_string_get_cstr(app->hex_path);
 
-    const char* cpath = furi_string_get_cstr(path);
     File* f = storage_file_alloc(app->storage);
     if(!f) {
         FURI_LOG_E(TAG, "firmware file handle allocation failed");
         app->upload_state = UploadFailed;
-        furi_string_free(path);
         return false;
     }
     do {
@@ -543,14 +677,11 @@ static bool upload_firmware(AppState* app) {
         app->upload_total = (uint32_t)total;
         app->upload_sent = 0;
         app->esp_hex_seen = 0;
-        uint8_t profile = deduce_profile(cpath);
-        FURI_LOG_I(
-            TAG, "upload %s (%lu bytes, profile %u)", cpath, (unsigned long)total, profile);
+        FURI_LOG_I(TAG, "upload %s (%lu bytes, agnostic)", cpath, (unsigned long)total);
 
-        /* FW_BEGIN */
+        /* FW_BEGIN (no profile). */
         proto_fw_begin_t begin = {
             .total_hex_bytes = (uint32_t)total,
-            .profile = profile,
         };
         pandora_esp32_uart_send(
             app->uart, PROTO_MSG_FW_BEGIN, (const uint8_t*)&begin, sizeof(begin));
@@ -590,8 +721,136 @@ static bool upload_firmware(AppState* app) {
 
     storage_file_close(f);
     storage_file_free(f);
-    furi_string_free(path);
     return ok;
+}
+
+/* Send the user's knock sequence to the ESP32 (PROTO_MSG_UNLOCK). The ESP32
+ * installs it with emu_set_knock() and auto-unlocks over GPIO. A count of 0
+ * disables auto-unlock (the user then unlocks manually with the buttons). */
+static void send_unlock(AppState* app) {
+    uint8_t buf[sizeof(proto_unlock_t) + KNOCK_MAX_STEPS * sizeof(proto_knock_step_t)];
+    proto_unlock_t uh = {
+        .count = app->knock_len,
+        .gate = app->knock_gate,
+    };
+    memcpy(buf, &uh, sizeof(uh));
+    size_t off = sizeof(uh);
+    for(uint8_t i = 0; i < app->knock_len; i++) {
+        proto_knock_step_t st = {.button = app->knock[i].button, .hold = app->knock[i].hold};
+        memcpy(buf + off, &st, sizeof(st));
+        off += sizeof(st);
+    }
+    pandora_esp32_uart_send(app->uart, PROTO_MSG_UNLOCK, buf, off);
+    FURI_LOG_I(TAG, "UNLOCK sent: %u steps, gate=%u", (unsigned)app->knock_len,
+               (unsigned)app->knock_gate);
+}
+
+/* Handle one input event while in the launch menu. */
+static void menu_input(AppState* app, InputEvent* e) {
+    if(e->type != InputTypePress && e->type != InputTypeRepeat) return;
+    switch(e->key) {
+    case InputKeyUp:
+        app->menu_row = (app->menu_row + MenuRowCount - 1) % MenuRowCount;
+        break;
+    case InputKeyDown:
+        app->menu_row = (app->menu_row + 1) % MenuRowCount;
+        break;
+    case InputKeyOk:
+    case InputKeyRight:
+        if(app->menu_row == MenuRowHex) {
+            choose_hex_file(app);
+        } else if(app->menu_row == MenuRowKnock) {
+            app->phase = PhaseKnockEdit;
+            app->knock_cursor = 0;
+        } else if(app->menu_row == MenuRowGate) {
+            /* cycle gate: none -> UP..B6 -> none */
+            if(app->knock_gate == PROTO_BTN_ID_NONE)
+                app->knock_gate = PROTO_BTN_ID_UP;
+            else if(app->knock_gate >= PROTO_BTN_ID_B6)
+                app->knock_gate = PROTO_BTN_ID_NONE;
+            else
+                app->knock_gate++;
+        } else if(app->menu_row == MenuRowLaunch) {
+            if(app->hex_chosen) {
+                app->launch_requested = true;
+            } else {
+                app->menu_row = MenuRowHex; /* nudge to pick a file first */
+            }
+        }
+        break;
+    case InputKeyLeft:
+        if(app->menu_row == MenuRowGate) {
+            if(app->knock_gate == PROTO_BTN_ID_NONE)
+                app->knock_gate = PROTO_BTN_ID_B6;
+            else if(app->knock_gate == PROTO_BTN_ID_UP)
+                app->knock_gate = PROTO_BTN_ID_NONE;
+            else
+                app->knock_gate--;
+        }
+        break;
+    default:
+        break;
+    }
+    app->ui_dirty = true;
+}
+
+/* Handle one input event while in the knock editor. */
+static void knock_input(AppState* app, InputEvent* e) {
+    bool is_long = (e->type == InputTypeLong);
+    if(e->type != InputTypePress && e->type != InputTypeRepeat && !is_long) return;
+
+    switch(e->key) {
+    case InputKeyLeft:
+        if(app->knock_cursor > 0) app->knock_cursor--;
+        break;
+    case InputKeyRight:
+        if(app->knock_cursor < app->knock_len) app->knock_cursor++;
+        break;
+    case InputKeyUp:
+        if(app->knock_cursor < app->knock_len) {
+            KnockStep* s = &app->knock[app->knock_cursor];
+            s->button = (s->button + 1) % 6; /* cycle UP..B6 */
+        }
+        break;
+    case InputKeyDown:
+        if(app->knock_cursor < app->knock_len) {
+            KnockStep* s = &app->knock[app->knock_cursor];
+            s->button = (s->button + 5) % 6;
+        }
+        break;
+    case InputKeyOk:
+        if(is_long) {
+            /* long OK = insert/add a step at the cursor (append if at end). */
+            if(app->knock_len < KNOCK_MAX_STEPS) {
+                uint8_t at = app->knock_cursor;
+                for(uint8_t i = app->knock_len; i > at; i--) app->knock[i] = app->knock[i - 1];
+                app->knock[at].button = PROTO_BTN_ID_UP;
+                app->knock[at].hold = 0;
+                app->knock_len++;
+            }
+        } else if(app->knock_cursor < app->knock_len) {
+            /* short OK = toggle hold on the current step. */
+            app->knock[app->knock_cursor].hold ^= 1u;
+        }
+        break;
+    case InputKeyBack:
+        if(is_long) {
+            /* long BACK = delete the current step. */
+            if(app->knock_len > 0 && app->knock_cursor < app->knock_len) {
+                for(uint8_t i = app->knock_cursor; i + 1 < app->knock_len; i++)
+                    app->knock[i] = app->knock[i + 1];
+                app->knock_len--;
+                if(app->knock_cursor > app->knock_len) app->knock_cursor = app->knock_len;
+            }
+        } else {
+            /* short BACK = done editing, back to the menu. */
+            app->phase = PhaseMenu;
+        }
+        break;
+    default:
+        break;
+    }
+    app->ui_dirty = true;
 }
 
 /* ------------------------------------------------------------ main */
@@ -633,26 +892,39 @@ int32_t pandora_esp32_app(void* p) {
     /* CC1101 radio bridge (PandoraARM pattern). */
     app->cc1101 = pandora_esp32_cc1101_alloc(cc1101_rx_edge_cb, app);
 
+    /* Knock defaults + chosen-path storage for the launch menu. */
+    app->hex_path = furi_string_alloc();
+    app->hex_chosen = false;
+    app->knock_len = (uint8_t)(sizeof(DEFAULT_KNOCK) / sizeof(DEFAULT_KNOCK[0]));
+    memcpy(app->knock, DEFAULT_KNOCK, sizeof(DEFAULT_KNOCK));
+    app->knock_gate = PROTO_BTN_ID_B5;
+    app->knock_cursor = 0;
+    app->menu_row = MenuRowHex;
+
     /* Keep link probing inside the normal app loop. The previous synchronous
      * handshake left the viewport and input queue unserviced while waiting for
      * UART; on some Flipper builds that looked like a permanent freeze. */
+    app->phase = PhaseLinkWait;
     app->upload_state = UploadCheckingLink;
     uint32_t link_started = furi_get_tick();
     app->link_deadline = link_started + 5000u;
     app->next_ping = link_started;
 
-    /* PHASE 2: event loop. Track per-key holds like PandoraARM. */
-    uint32_t up_press_t0 = 0;
-    bool up_down = false;
-    bool up_consumed = false;
+    /* Track BACK long-hold for app EXIT (any phase). Flipper BACK = keyfob B6;
+     * a >1s hold exits the app without stealing the B6 long-press function. */
+    uint32_t back_press_t0 = 0;
+    bool back_down = false;
+    bool back_consumed = false;
 
     while(!app->exit_requested) {
         uint32_t now = furi_get_tick();
-        if(app->upload_state == UploadCheckingLink) {
+
+        /* ---- link probe (until PONG) ---- */
+        if(app->phase == PhaseLinkWait) {
             if(app->pong_seen) {
                 FURI_LOG_I(TAG, "ESP32 link ready after %u probe(s)",
                            (unsigned)app->ping_attempts);
-                app->upload_state = UploadChoosingFile;
+                app->phase = PhaseMenu;
                 app->ui_dirty = true;
             } else if((int32_t)(now - app->link_deadline) >= 0) {
                 FURI_LOG_E(TAG,
@@ -668,28 +940,40 @@ int32_t pandora_esp32_app(void* p) {
             }
         }
 
-        /* Start the modal firmware picker only after PONG, from the app thread.
-         * It runs once; link probing and timeout remain responsive before then. */
-        if(app->pong_seen && !app->upload_started) {
-            app->upload_started = true;
+        /* ---- Launch: upload firmware + send the knock ---- */
+        if(app->launch_requested) {
+            app->launch_requested = false;
+            app->phase = PhaseLaunching;
+            app->ui_dirty = true;
+            view_port_update(app->view_port);
             if(upload_firmware(app)) {
                 app->upload_state = UploadWaitingAck;
                 app->ack_deadline = furi_get_tick() + FW_ACK_TIMEOUT_MS;
+                /* The ESP32 boots on FW_END; send the knock so it auto-unlocks.
+                 * (Harmless if sent slightly early: it is applied once emu is up,
+                 * and re-sendable via Launch.) */
+                send_unlock(app);
             } else {
-                FURI_LOG_W(TAG, "firmware upload skipped/failed; ESP32 may hold an image");
+                FURI_LOG_W(TAG, "firmware upload failed; returning to menu");
+                app->phase = PhaseMenu;
             }
-            app->ui_dirty = true;
         }
 
-        if(app->upload_state == UploadWaitingAck && !app->fw_acked &&
+        if(app->phase == PhaseLaunching && !app->fw_acked &&
            (int32_t)(now - app->ack_deadline) >= 0) {
             FURI_LOG_E(TAG, "FW_ACK timeout after upload (%lu/%lu ESP32 parsed)",
                        (unsigned long)app->esp_hex_seen,
                        (unsigned long)app->upload_total);
             app->upload_state = UploadFailed;
+            app->phase = PhaseMenu;
             app->ui_dirty = true;
         }
 
+        /* On ACK, enter the running phase and ask for the first frame. */
+        if(app->fw_acked && app->phase != PhaseRunning) {
+            app->phase = PhaseRunning;
+            app->ui_dirty = true;
+        }
         if(app->fw_acked && !app->fb_requested) {
             pandora_esp32_uart_send(app->uart, PROTO_MSG_REQ_FB, NULL, 0);
             app->fb_requested = true;
@@ -697,39 +981,48 @@ int32_t pandora_esp32_app(void* p) {
 
         InputEvent event;
         if(furi_message_queue_get(app->input_queue, &event, 5) == FuriStatusOk) {
-            FURI_LOG_I(TAG, "input key=%u type=%u", (unsigned)event.key, (unsigned)event.type);
-            uint8_t bit = flipper_key_to_btn(event.key);
+            FURI_LOG_D(TAG, "input key=%u type=%u", (unsigned)event.key, (unsigned)event.type);
 
-            /* Flipper UP long-hold = EXIT (host-side). Track it specially. */
-            if(event.key == InputKeyUp) {
+            /* BACK long-hold = EXIT the app (tracked in every phase). */
+            if(event.key == InputKeyBack) {
                 if(event.type == InputTypePress) {
-                    up_down = true;
-                    up_consumed = false;
-                    up_press_t0 = furi_get_tick();
+                    back_down = true;
+                    back_consumed = false;
+                    back_press_t0 = furi_get_tick();
                 } else if(event.type == InputTypeRelease) {
-                    up_down = false;
+                    back_down = false;
                 }
             }
 
-            /* Button bitmask -> ESP32. Press sets the bit, release clears it. */
-            if(bit) {
-                if(event.type == InputTypePress) {
-                    app->btn_mask |= bit;
-                } else if(event.type == InputTypeRelease) {
-                    app->btn_mask &= (uint8_t)~bit;
+            if(app->phase == PhaseMenu) {
+                menu_input(app, &event);
+            } else if(app->phase == PhaseKnockEdit) {
+                knock_input(app, &event);
+            } else if(app->phase == PhaseRunning) {
+                /* Button bitmask -> ESP32. Press sets the bit, release clears it.
+                 * Fallback manual unlock: the user navigates with these buttons if
+                 * the knock was wrong. */
+                uint8_t bit = flipper_key_to_btn(event.key);
+                if(bit) {
+                    if(event.type == InputTypePress) {
+                        app->btn_mask |= bit;
+                    } else if(event.type == InputTypeRelease) {
+                        app->btn_mask &= (uint8_t)~bit;
+                    }
                 }
             }
         }
 
-        /* UP held > 1s => EXIT (consumed once). */
-        if(up_down && !up_consumed && (furi_get_tick() - up_press_t0) >= EXIT_HOLD_MS) {
+        /* BACK held > 1s => EXIT (consumed once). In the running phase this means
+         * a short BACK is still a keyfob B6 tap, only a long hold exits. */
+        if(back_down && !back_consumed && (furi_get_tick() - back_press_t0) >= EXIT_HOLD_MS) {
             app->exit_requested = true;
-            up_consumed = true;
+            back_consumed = true;
         }
 
-        /* Send the button mask to the ESP32 only when it changes. */
-        if(app->btn_mask != app->last_sent_mask) {
-            FURI_LOG_I(TAG, "BTN send mask=0x%02X", app->btn_mask);
+        /* Send the button mask to the ESP32 only when it changes (running only). */
+        if(app->phase == PhaseRunning && app->btn_mask != app->last_sent_mask) {
+            FURI_LOG_D(TAG, "BTN send mask=0x%02X", app->btn_mask);
             pandora_esp32_uart_send(app->uart, PROTO_MSG_BTN, &app->btn_mask, 1);
             app->last_sent_mask = app->btn_mask;
         }
@@ -779,6 +1072,7 @@ int32_t pandora_esp32_app(void* p) {
 
     furi_message_queue_free(app->input_queue);
     furi_mutex_free(app->fb_mutex);
+    if(app->hex_path) furi_string_free(app->hex_path);
 
     furi_record_close(RECORD_GUI);
     furi_record_close(RECORD_DIALOGS);
