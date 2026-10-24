@@ -12,8 +12,7 @@
 #define FIAT_V0_GAP_US          800
 #define FIAT_V0_TOTAL_BURSTS    3
 #define FIAT_V0_INTER_BURST_GAP 25000
-/* Buffer sized for worst case: 3 bursts * (150*2 preamble + 2 + 63*2 data + 7*2 endbyte + 1 gap) + 2 inter-burst gaps = 1331.
- * 2048 gives plenty of headroom. */
+/* Worst case with 3 bursts: ~1331 elements. 2048 gives headroom. */
 #define FIAT_V0_UPLOAD_CAPACITY 2048U
 
 static const SubGhzBlockConst subghz_protocol_fiat_v0_const = {
@@ -141,9 +140,9 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
 
     uint64_t data = ((uint64_t)instance->hop << 32) | instance->fix;
 
-    /* The wire frame is 71 bits: 64 data bits + 7 endbyte bits.
-     * The decoder masks the highest endbyte bit (bit 65 on the wire), so we
-     * send the 7-bit endbyte value unchanged. Replay round-trips exactly. */
+    /* Frame is 71 bits on the wire: 64 data + 7 endbyte.
+     * Send endbyte unchanged (no shift). Decoder masks to 0x3F on RX,
+     * so replay round-trips consistently. */
     uint8_t endbyte_to_send = instance->endbyte & 0x7F;
 
     for(uint8_t burst = 0; burst < FIAT_V0_TOTAL_BURSTS; burst++) {
@@ -186,8 +185,7 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
             prev_bit = curr_bit;
         }
 
-        /* 7 endbyte bits, unconditional. The frame must always be 71 bits
-         * total or the receiver silently drops it. */
+        /* 7 endbyte bits, unconditional. Must always be 71 bits total. */
         for(int bit = 6; bit >= 0; bit--) {
             bool curr_bit = (endbyte_to_send >> bit) & 1;
             furi_check(index + 2 <= cap);
@@ -224,9 +222,8 @@ SubGhzProtocolStatus
     instance->encoder.is_running = false;
     instance->encoder.front = 0;
 
-    /* Free any previous upload buffer BEFORE allocating a new one.
-     * Without this the Sub-GHz app leaks ~4 KB every time it reloads the file
-     * (which happens on every custom-button change) and eventually crashes. */
+    /* Free previous upload buffer BEFORE allocating a new one.
+     * Fixes the heap leak that crashes the app after repeated TX. */
     if(instance->encoder.upload) {
         free(instance->encoder.upload);
         instance->encoder.upload = NULL;
@@ -270,12 +267,8 @@ SubGhzProtocolStatus
             instance->endbyte = (uint8_t)(btn_u32 & 0x7FU);
         }
 
-        /* Fiat V0 is REPLAY-ONLY.
-         * The rolling field (hop, upper 32 bits of Key) is opaque/encrypted
-         * with no known key or forward-computable checksum, so we cannot
-         * synthesise a valid NEXT frame for a changed button or advanced
-         * counter. We replay the CAPTURED endbyte exactly. D-pad UI is
-         * collapsed to a single button so it doesn't imply otherwise. */
+        /* Fiat V0 is REPLAY-ONLY. Rolling code is opaque, cannot synthesise
+         * next frame. Replay captured endbyte exactly. */
         {
             const uint8_t original_btn = instance->endbyte;
             if(subghz_custom_btn_get_original() == 0) {
