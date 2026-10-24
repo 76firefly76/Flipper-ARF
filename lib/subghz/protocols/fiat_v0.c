@@ -19,7 +19,7 @@ static const SubGhzBlockConst subghz_protocol_fiat_v0_const = {
     .te_short = 200,
     .te_long = 400,
     .te_delta = 100,
-    .min_count_bit_for_found = 64,
+    .min_count_bit_for_found = 71,
 };
 
 struct SubGhzProtocolDecoderFiatV0 {
@@ -61,7 +61,6 @@ struct SubGhzProtocolEncoderFiatV0 {
     SubGhzProtocolEncoderBase base;
     SubGhzProtocolBlockEncoder encoder;
     SubGhzBlockGeneric generic;
-
     uint32_t hop;
     uint32_t fix;
     uint8_t endbyte;
@@ -109,15 +108,12 @@ void* subghz_protocol_encoder_fiat_v0_alloc(SubGhzEnvironment* environment) {
     UNUSED(environment);
     SubGhzProtocolEncoderFiatV0* instance = calloc(1, sizeof(SubGhzProtocolEncoderFiatV0));
     furi_check(instance);
-
     instance->base.protocol = &fiat_protocol_v0;
     instance->generic.protocol_name = instance->base.protocol->name;
-
     instance->encoder.repeat = 10;
     instance->encoder.size_upload = 0;
     instance->encoder.upload = NULL;
     instance->encoder.is_running = false;
-
     return instance;
 }
 
@@ -139,10 +135,7 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
     uint32_t te_long = subghz_protocol_fiat_v0_const.te_long;
 
     uint64_t data = ((uint64_t)instance->hop << 32) | instance->fix;
-
-    /* Frame is 71 bits on the wire: 64 data + 7 endbyte.
-     * Send endbyte unchanged (no shift). Decoder masks to 0x3F on RX,
-     * so replay round-trips consistently. */
+    /* Frame is 71 bits: 64 data + 7 endbyte. Send endbyte unchanged. */
     uint8_t endbyte_to_send = instance->endbyte & 0x7F;
 
     for(uint8_t burst = 0; burst < FIAT_V0_TOTAL_BURSTS; burst++) {
@@ -150,7 +143,6 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
         if(burst > 0) {
             up[index++] = level_duration_make(false, FIAT_V0_INTER_BURST_GAP);
         }
-
         for(int i = 0; i < FIAT_V0_PREAMBLE_PAIRS; i++) {
             furi_check(index + 2 <= cap);
             up[index++] = level_duration_make(true, te_short);
@@ -222,8 +214,7 @@ SubGhzProtocolStatus
     instance->encoder.is_running = false;
     instance->encoder.front = 0;
 
-    /* Free previous upload buffer BEFORE allocating a new one.
-     * Fixes the heap leak that crashes the app after repeated TX. */
+    /* Free previous upload buffer BEFORE allocating a new one. */
     if(instance->encoder.upload) {
         free(instance->encoder.upload);
         instance->encoder.upload = NULL;
@@ -267,8 +258,7 @@ SubGhzProtocolStatus
             instance->endbyte = (uint8_t)(btn_u32 & 0x7FU);
         }
 
-        /* Fiat V0 is REPLAY-ONLY. Rolling code is opaque, cannot synthesise
-         * next frame. Replay captured endbyte exactly. */
+        /* Fiat V0 is REPLAY-ONLY. Replay captured endbyte exactly. */
         {
             const uint8_t original_btn = instance->endbyte;
             if(subghz_custom_btn_get_original() == 0) {
@@ -501,13 +491,13 @@ void subghz_protocol_decoder_fiat_v0_feed(void* context, bool level, uint32_t du
                     instance->data_high = 0;
                 }
                 if(instance->bit_count == 0x47) {
-                    instance->endbyte = (uint8_t)(instance->data_low & 0x3F);
+                    instance->endbyte = (uint8_t)(instance->data_low & 0x7F);
                     fiat_v0_finish_packet(instance);
                 }
             }
         } else {
             if(instance->bit_count == 0x47) {
-                instance->endbyte = (uint8_t)(instance->data_low & 0x3F);
+                instance->endbyte = (uint8_t)(instance->data_low & 0x7F);
                 fiat_v0_finish_packet(instance);
             } else if(instance->bit_count < 64) {
                 instance->decoder.parser_step = FiatV0DecoderStepReset;
