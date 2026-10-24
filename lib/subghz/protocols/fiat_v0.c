@@ -12,7 +12,9 @@
 #define FIAT_V0_GAP_US          800
 #define FIAT_V0_TOTAL_BURSTS    3
 #define FIAT_V0_INTER_BURST_GAP 25000
-#define FIAT_V0_UPLOAD_CAPACITY 1328U
+/* Buffer sized for worst case: 3 bursts * (150*2 preamble + 2 + 63*2 data + 7*2 endbyte + 1 gap) + 2 inter-burst gaps = 1331.
+ * 2048 gives plenty of headroom. */
+#define FIAT_V0_UPLOAD_CAPACITY 2048U
 
 static const SubGhzBlockConst subghz_protocol_fiat_v0_const = {
     .te_short = 200,
@@ -133,24 +135,32 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
     if(up == NULL) return;
 
     size_t index = 0;
+    const size_t cap = FIAT_V0_UPLOAD_CAPACITY;
     uint32_t te_short = subghz_protocol_fiat_v0_const.te_short;
     uint32_t te_long = subghz_protocol_fiat_v0_const.te_long;
 
     uint64_t data = ((uint64_t)instance->hop << 32) | instance->fix;
-    uint8_t endbyte_to_send = instance->endbyte >> 1;
+
+    /* The wire frame is 71 bits: 64 data bits + 7 endbyte bits.
+     * The decoder masks the highest endbyte bit (bit 65 on the wire), so we
+     * send the 7-bit endbyte value unchanged. Replay round-trips exactly. */
+    uint8_t endbyte_to_send = instance->endbyte & 0x7F;
 
     for(uint8_t burst = 0; burst < FIAT_V0_TOTAL_BURSTS; burst++) {
+        furi_check(index < cap);
         if(burst > 0) {
             up[index++] = level_duration_make(false, FIAT_V0_INTER_BURST_GAP);
         }
 
         for(int i = 0; i < FIAT_V0_PREAMBLE_PAIRS; i++) {
+            furi_check(index + 2 <= cap);
             up[index++] = level_duration_make(true, te_short);
             up[index++] = level_duration_make(false, te_short);
         }
         if(index > 0) up[index - 1] = level_duration_make(false, FIAT_V0_GAP_US);
 
         bool first_bit = (data >> 63) & 1;
+        furi_check(index + 2 <= cap);
         if(first_bit) {
             up[index++] = level_duration_make(true, te_long);
         } else {
@@ -161,6 +171,7 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
 
         for(int bit = 62; bit >= 0; bit--) {
             bool curr_bit = (data >> bit) & 1;
+            furi_check(index + 2 <= cap);
             if(!prev_bit && !curr_bit) {
                 up[index++] = level_duration_make(true, te_short);
                 up[index++] = level_duration_make(false, te_short);
@@ -175,8 +186,11 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
             prev_bit = curr_bit;
         }
 
-        for(int bit = 5; bit >= 0; bit--) {
+        /* 7 endbyte bits, unconditional. The frame must always be 71 bits
+         * total or the receiver silently drops it. */
+        for(int bit = 6; bit >= 0; bit--) {
             bool curr_bit = (endbyte_to_send >> bit) & 1;
+            furi_check(index + 2 <= cap);
             if(!prev_bit && !curr_bit) {
                 up[index++] = level_duration_make(true, te_short);
                 up[index++] = level_duration_make(false, te_short);
@@ -191,6 +205,7 @@ static void subghz_protocol_encoder_fiat_v0_get_upload(SubGhzProtocolEncoderFiat
             prev_bit = curr_bit;
         }
 
+        furi_check(index + 2 <= cap);
         if(prev_bit) {
             up[index++] = level_duration_make(false, te_short);
         }
@@ -208,6 +223,14 @@ SubGhzProtocolStatus
 
     instance->encoder.is_running = false;
     instance->encoder.front = 0;
+
+    /* Free any previous upload buffer BEFORE allocating a new one.
+     * Without this the Sub-GHz app leaks ~4 KB every time it reloads the file
+     * (which happens on every custom-button change) and eventually crashes. */
+    if(instance->encoder.upload) {
+        free(instance->encoder.upload);
+        instance->encoder.upload = NULL;
+    }
 
     do {
         flipper_format_rewind(flipper_format);
@@ -247,30 +270,22 @@ SubGhzProtocolStatus
             instance->endbyte = (uint8_t)(btn_u32 & 0x7FU);
         }
 
-        // [PROTOPIRATE_PORT] Fiat V0 is REPLAY-ONLY.
-        // The rolling field (hop, upper 32 bits of Key) is opaque/encrypted with
-        // no known key or forward-computable checksum, so we cannot synthesize a
-        // valid NEXT frame for a changed button or an advanced counter. Matching
-        // ProtoPirate's emu_button_for_protocol() ("Fiat" -> return original), we
-        // replay the CAPTURED endbyte/button exactly and never pretend to
-        // increment the counter. The custom_btn machinery is still primed (so the
-        // D-pad UI behaves consistently and OK is a plain replay), but every
-        // selection re-emits the captured frame byte-identically.
+        /* Fiat V0 is REPLAY-ONLY.
+         * The rolling field (hop, upper 32 bits of Key) is opaque/encrypted
+         * with no known key or forward-computable checksum, so we cannot
+         * synthesise a valid NEXT frame for a changed button or advanced
+         * counter. We replay the CAPTURED endbyte exactly. D-pad UI is
+         * collapsed to a single button so it doesn't imply otherwise. */
         {
             const uint8_t original_btn = instance->endbyte;
             if(subghz_custom_btn_get_original() == 0) {
                 subghz_custom_btn_set_original(original_btn);
             }
-            // Only OK is meaningful for a replay-only protocol; advertise a single
-            // button so the UI does not imply forward-encoded directions exist.
             subghz_custom_btn_set_max(1);
-            // Replay the captured endbyte regardless of the selected custom_btn.
             instance->endbyte = (uint8_t)(original_btn & 0x7FU);
         }
 
         instance->generic.btn = instance->endbyte;
-        // Counter (hop) is replay-only: keep the captured hop; do NOT read/apply an
-        // incremented "Cnt" because we cannot recompute the encrypted rolling code.
         instance->generic.cnt = instance->hop;
         instance->generic.serial = instance->fix;
 
@@ -280,6 +295,7 @@ SubGhzProtocolStatus
         instance->encoder.repeat = repeat;
 
         instance->encoder.upload = malloc(FIAT_V0_UPLOAD_CAPACITY * sizeof(LevelDuration));
+        furi_check(instance->encoder.upload);
         subghz_protocol_encoder_fiat_v0_get_upload(instance);
         instance->encoder.is_running = true;
 
@@ -315,6 +331,7 @@ LevelDuration subghz_protocol_encoder_fiat_v0_yield(void* context) {
 
     return ret;
 }
+
 // ============================================================================
 // DECODER IMPLEMENTATION
 // ============================================================================
